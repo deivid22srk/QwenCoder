@@ -4,6 +4,13 @@ Este documento descreve as **extensões adicionadas** ao QwenBridge para suporta
 o app Android **QwenCoder**. As extensões são 100% aditivas — não alteram
 comportamento existente para clientes que não usam tools.
 
+> **Changelog (patch 2 — fix crashes):**
+> - `accounts/stream`: trocou `stream.addEventListener("abort", ...)` (não existe na API Hono v4) por loop `while (!stream.aborted) + stream.sleep()`. Resolve `TypeError: stream.addEventListener is not a function` que crashava o proxy quando o app abria a tela de configurações.
+> - `POST /v1/accounts`: agora dispara `initPlaywrightForAccount` em background para cada conta adicionada — sem isso, `/v1/models` continuava 401 após add.
+> - `accounts/stream`: `getCooldownStatus()` envolto em try/catch — em startup frio pode falhar.
+> - App Flutter: `listModels()` agora trata 401 retornando lista fallback de modelos Qwen padrão (não trava UI quando proxy ainda não tem contas).
+> - App Flutter: `streamAccounts()` agora reconecta automaticamente com backoff exponencial em caso de erro de rede ou proxy reiniciando.
+
 ---
 
 ## Novos endpoints

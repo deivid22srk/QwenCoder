@@ -158,11 +158,65 @@ accountsApp.post("/", async (c) => {
 
   invalidateAccountsCache();
 
+  // Auto-inicializa Playwright para cada conta adicionada com sucesso,
+  // em background (não bloqueia a resposta). Sem isso, a conta existe no
+  // banco mas não tem headers auth — /v1/models e /v1/chat/completions
+  // continuariam retornando 401.
+  const addedAccounts = results.filter((r) => r.status === "ok" && r.id);
+  if (addedAccounts.length > 0) {
+    (async () => {
+      try {
+        const { getAccountCredentials } = await import("../../core/accounts.ts");
+        const { initPlaywrightForAccount, isPlaywrightClosing } = await import(
+          "../../services/playwright.ts"
+        );
+        const { disableNativeTools, warmQwenChatPool } = await import(
+          "../../services/qwen.ts"
+        );
+        const { config } = await import("../../core/config.ts");
+
+        for (const r of addedAccounts) {
+          if (isPlaywrightClosing()) break;
+          try {
+            const creds = getAccountCredentials(r.id!);
+            if (!creds) {
+              logger.warn("Accounts API", `No credentials for ${r.id} (warmup)`);
+              continue;
+            }
+            logger.info("Accounts API", `Auto-init Playwright for ${r.email}…`);
+            await initPlaywrightForAccount(
+              creds,
+              config.playwright.headless,
+              config.playwright.browser,
+            );
+            await disableNativeTools(creds.id).catch(() => {});
+            await warmQwenChatPool(creds.id, "qwen3-coder-plus").catch(() => {});
+            logger.info("Accounts API", `Auto-init OK for ${r.email}`);
+          } catch (e) {
+            logger.error(
+              "Accounts API",
+              `Auto-init failed for ${r.email}: ${(e as Error).message}`,
+            );
+          }
+        }
+      } catch (e) {
+        logger.error(
+          "Accounts API",
+          `Auto-init bootstrap failed: ${(e as Error).message}`,
+        );
+      }
+    })();
+  }
+
   return c.json({
     added: results.filter((r) => r.status === "ok").length,
     skipped: results.filter((r) => r.status === "skip").length,
     failed: results.filter((r) => r.status === "fail").length,
     results,
+    note:
+      addedAccounts.length > 0
+        ? `${addedAccounts.length} account(s) queued for Playwright init in background. Models endpoint will be available shortly.`
+        : undefined,
   }, 201);
 });
 
@@ -237,24 +291,44 @@ accountsApp.patch("/:id", async (c) => {
 accountsApp.get("/stream", (c) => {
   return streamSSE(c, async (stream) => {
     // Envia snapshot inicial
-    const accounts = listAccounts();
-    const cooldowns = getCooldownStatus() as Record<string, unknown>;
-    await stream.writeSSE({
-      event: "snapshot",
-      data: JSON.stringify({
-        accounts: accounts.map(toDto),
-        cooldowns,
-        timestamp: Date.now(),
-      }),
-    });
+    let accounts: any[] = [];
+    let cooldowns: Record<string, unknown> = {};
+    try {
+      accounts = listAccounts();
+      cooldowns = (getCooldownStatus() as Record<string, unknown>) || {};
+    } catch (e) {
+      // Em startup frio, getCooldownStatus pode falhar — não derruba o stream
+      console.warn("[Accounts SSE] snapshot init failed:", (e as Error).message);
+    }
+    try {
+      await stream.writeSSE({
+        event: "snapshot",
+        data: JSON.stringify({
+          accounts: accounts.map(toDto),
+          cooldowns,
+          timestamp: Date.now(),
+        }),
+      });
+    } catch (e) {
+      // Cliente desconectou antes do snapshot — sai silenciosamente
+      return;
+    }
 
-    // Heartbeat a cada 10s para manter conexão viva + emitir status atualizado
+    // Heartbeat a cada 10s — usa stream.sleep() + stream.aborted (API Hono v4)
+    // Quando o cliente fecha a conexão, stream.aborted vira true e saímos do loop.
     let heartbeat = 0;
-    const interval = setInterval(async () => {
+    while (!stream.aborted) {
+      try {
+        await stream.sleep(10_000);
+      } catch {
+        // sleep rejeita quando conexão fecha
+        break;
+      }
+      if (stream.aborted) break;
       heartbeat++;
       try {
         const accs = listAccounts();
-        const cds = getCooldownStatus() as Record<string, unknown>;
+        const cds = (getCooldownStatus() as Record<string, unknown>) || {};
         await stream.writeSSE({
           event: "heartbeat",
           data: JSON.stringify({
@@ -265,20 +339,9 @@ accountsApp.get("/stream", (c) => {
           }),
         });
       } catch (e) {
-        // Conexao fechada — clearInterval abaixo via abort
+        // writeSSE rejeita quando conexão fechou — sai do loop
+        break;
       }
-    }, 10_000);
-
-    // Mantém a conexão aberta até o cliente desconectar
-    try {
-      // Aguarda evento de abort do stream
-      // Hono fornece stream.aborted (AbortSignal)
-      await new Promise<void>((resolve) => {
-        if (stream.aborted) return resolve();
-        stream.addEventListener("abort", () => resolve());
-      });
-    } finally {
-      clearInterval(interval);
     }
   });
 });

@@ -57,6 +57,9 @@ class ApiClient {
   }
 
   /// Lista modelos disponíveis no proxy.
+  /// Retorna lista vazia se:
+  /// - O proxy não tem contas Qwen configuradas (401)
+  /// - Erro de rede
   Future<List<String>> listModels() async {
     try {
       final r = await Dio(BaseOptions(
@@ -65,19 +68,36 @@ class ApiClient {
           if (_apiKey.isNotEmpty) 'Authorization': 'Bearer $_apiKey',
         },
         responseType: ResponseType.json,
+        receiveTimeout: const Duration(seconds: 15),
+        validateStatus: (s) => s != null && s < 500,
       )).get<Map<String, dynamic>>('/v1/models');
+      if (r.statusCode == 401) {
+        // Sem contas configuradas no proxy — usa fallback de modelos padrão
+        return _fallbackModels;
+      }
       final data = r.data;
-      if (data == null) return const [];
+      if (data == null) return _fallbackModels;
       final list = data['data'] as List? ?? [];
-      return list
+      final models = list
           .map((m) => (m as Map<String, dynamic>)['id'] as String?)
           .where((s) => s != null && s.isNotEmpty)
           .cast<String>()
           .toList();
+      return models.isEmpty ? _fallbackModels : models;
     } catch (_) {
-      return const [];
+      return _fallbackModels;
     }
   }
+
+  /// Modelos Qwen padrão para fallback quando o proxy não tem contas ainda.
+  /// (mesma lista do README do QwenBridge)
+  static const _fallbackModels = <String>[
+    'qwen3-coder-plus',
+    'qwen3.7-plus',
+    'qwen3.7-max',
+    'qwen3.6-plus',
+    'qwen3.5-flash',
+  ];
 
   /// Lista tools server-side disponíveis no proxy (endpoint /v1/tools).
   Future<List<Map<String, dynamic>>> listServerTools() async {
@@ -154,48 +174,64 @@ class ApiClient {
 
   /// `GET /v1/accounts/stream` — SSE de mudanças de status em tempo real.
   /// Emite um evento a cada snapshot/heartbeat recebido do proxy.
+  /// Reconecta automaticamente em caso de erro de rede.
   Stream<AccountsSnapshot> streamAccounts() async* {
-    final resp = await _dio.get<ResponseBody>(
-      '/v1/accounts/stream',
-      options: Options(responseType: ResponseType.stream, headers: {'Accept': 'text/event-stream'}),
-    );
-    final stream = resp.data?.stream;
-    if (stream == null) return;
-    final lineBuf = StringBuffer();
-    await for (final chunk in stream) {
-      lineBuf.write(utf8.decode(chunk, allowMalformed: true));
-      final raw = lineBuf.toString();
-      if (!raw.contains('\n')) continue;
-      final lines = raw.split('\n');
-      lineBuf.clear();
-      lineBuf.write(lines.removeLast());
-      String? eventName;
-      for (final line in lines) {
-        final trimmed = line.trim();
-        if (trimmed.isEmpty) {
-          // Fim de evento — se tínhamos data, processa
-          eventName = null;
+    int reconnectDelay = 1;
+    while (true) {
+      try {
+        final resp = await _dio.get<ResponseBody>(
+          '/v1/accounts/stream',
+          options: Options(responseType: ResponseType.stream, headers: {'Accept': 'text/event-stream'}),
+        );
+        final stream = resp.data?.stream;
+        if (stream == null) {
+          await Future.delayed(Duration(seconds: reconnectDelay));
+          reconnectDelay = (reconnectDelay * 2).clamp(1, 30);
           continue;
         }
-        if (trimmed.startsWith('event:')) {
-          eventName = trimmed.substring(6).trim();
-        } else if (trimmed.startsWith('data:')) {
-          final payload = trimmed.substring(5).trim();
-          if (eventName == 'snapshot' || eventName == 'heartbeat') {
-            try {
-              final j = jsonDecode(payload) as Map<String, dynamic>;
-              final accs = j['accounts'];
-              if (accs is List) {
-                yield AccountsSnapshot.fromJson({
-                  'total': accs.length,
-                  'active': accs.where((a) => !(a as Map)['in_cooldown']).length,
-                  'in_cooldown': accs.where((a) => (a as Map)['in_cooldown']).length,
-                  'accounts': accs,
-                });
+        reconnectDelay = 1; // reset após sucesso
+        final lineBuf = StringBuffer();
+        String? currentEventName;
+        await for (final chunk in stream) {
+          lineBuf.write(utf8.decode(chunk, allowMalformed: true));
+          final raw = lineBuf.toString();
+          if (!raw.contains('\n')) continue;
+          final lines = raw.split('\n');
+          lineBuf.clear();
+          lineBuf.write(lines.removeLast());
+          for (final line in lines) {
+            final trimmed = line.trim();
+            if (trimmed.isEmpty) {
+              currentEventName = null;
+              continue;
+            }
+            if (trimmed.startsWith('event:')) {
+              currentEventName = trimmed.substring(6).trim();
+            } else if (trimmed.startsWith('data:')) {
+              final payload = trimmed.substring(5).trim();
+              if (currentEventName == 'snapshot' || currentEventName == 'heartbeat') {
+                try {
+                  final j = jsonDecode(payload) as Map<String, dynamic>;
+                  final accs = j['accounts'];
+                  if (accs is List) {
+                    yield AccountsSnapshot.fromJson({
+                      'total': accs.length,
+                      'active': accs.where((a) => !(a as Map)['in_cooldown']).length,
+                      'in_cooldown': accs.where((a) => (a as Map)['in_cooldown']).length,
+                      'accounts': accs,
+                    });
+                  }
+                } catch (_) {}
               }
-            } catch (_) {}
+            }
           }
         }
+        // Stream fechou normalmente — reconecta
+        await Future.delayed(const Duration(seconds: 2));
+      } catch (e) {
+        // Erro de rede — reconecta com backoff
+        await Future.delayed(Duration(seconds: reconnectDelay));
+        reconnectDelay = (reconnectDelay * 2).clamp(1, 30);
       }
     }
   }
