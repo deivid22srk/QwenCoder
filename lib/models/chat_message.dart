@@ -1,6 +1,8 @@
 import 'package:flutter/foundation.dart';
 import 'tool_call.dart';
 
+export 'tool_call.dart' show MessageRole, ToolCall;
+
 /// Status de uma mensagem no histórico.
 enum MessageStatus {
   sending,

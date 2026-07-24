@@ -132,7 +132,7 @@ class AppTheme {
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
         ),
       ),
-      cardTheme: CardThemeData(
+      cardTheme: CardTheme(
         color: bgSurface,
         elevation: 0,
         shape: RoundedRectangleBorder(
@@ -171,12 +171,14 @@ class AppTheme {
     FontWeight? fontWeight,
     Color? color,
     double? height,
+    double? letterSpacing,
   }) =>
       GoogleFonts.sourceSerif4(
         fontSize: fontSize,
         fontWeight: fontWeight,
         color: color ?? textPrimary,
         height: height,
+        letterSpacing: letterSpacing,
       );
 
   /// Fonte sans para mensagens do usuário / UI — Inter via Google Fonts.
@@ -185,11 +187,13 @@ class AppTheme {
     FontWeight? fontWeight,
     Color? color,
     double? height,
+    double? letterSpacing,
   }) =>
       GoogleFonts.inter(
         fontSize: fontSize,
         fontWeight: fontWeight,
         color: color ?? textPrimary,
         height: height,
+        letterSpacing: letterSpacing,
       );
 }

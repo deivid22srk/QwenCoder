@@ -127,7 +127,7 @@ class _SendButton extends StatelessWidget {
   Widget build(BuildContext context) {
     final enabled = onTap != null;
     return Material(
-      color: enabled ? color : color.withValues(alpha: 0.4),
+      color: enabled ? color : color.withOpacity(0.4),
       borderRadius: BorderRadius.circular(14),
       child: InkWell(
         onTap: onTap,

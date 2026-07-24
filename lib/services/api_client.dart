@@ -148,8 +148,9 @@ class ApiClient {
               yield ChatStreamEvent.error(errMsg.toString());
               return;
             }
-            final choice = (json['choices'] as List?)?.firstOrNull as Map<String, dynamic>?;
-            if (choice == null) continue;
+            final choices = json['choices'] as List?;
+            if (choices == null || choices.isEmpty) continue;
+            final choice = choices.first as Map<String, dynamic>;
             final delta = choice['delta'] as Map<String, dynamic>?;
             if (delta != null) {
               if (delta['content'] is String) {
@@ -189,7 +190,11 @@ class ApiClient {
       final data = e.response?.data;
       String msg = e.message ?? 'Dio error';
       if (data is List) {
-        msg = utf8.decode(data, allowMalformed: true);
+        // dio retorna List<dynamic>; utf8.decode espera List<int>
+        final bytes = (data as List).whereType<int>().toList(growable: false);
+        if (bytes.isNotEmpty) {
+          msg = utf8.decode(bytes, allowMalformed: true);
+        }
       } else if (data is String) {
         msg = data;
       } else if (data is Map) {
@@ -312,12 +317,8 @@ class _ToolCallAcc {
     try {
       final d = jsonDecode(s2);
       if (d is Map) return Map<String, dynamic>.from(d);
-    } catch (_) {
-      return {'_raw': trimmed};
-    }
+    } catch (_) {}
+    // Fallback final — devolve o conteúdo cru em _raw
+    return {'_raw': trimmed};
   }
-}
-
-extension on List {
-  Object? get firstOrNull => isEmpty ? null : first;
 }
