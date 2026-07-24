@@ -172,6 +172,7 @@ class AppTheme {
     Color? color,
     double? height,
     double? letterSpacing,
+    FontStyle? fontStyle,
   }) =>
       GoogleFonts.sourceSerif4(
         fontSize: fontSize,
@@ -179,6 +180,7 @@ class AppTheme {
         color: color ?? textPrimary,
         height: height,
         letterSpacing: letterSpacing,
+        fontStyle: fontStyle,
       );
 
   /// Fonte sans para mensagens do usuário / UI — Inter via Google Fonts.
@@ -188,6 +190,7 @@ class AppTheme {
     Color? color,
     double? height,
     double? letterSpacing,
+    FontStyle? fontStyle,
   }) =>
       GoogleFonts.inter(
         fontSize: fontSize,
@@ -195,5 +198,6 @@ class AppTheme {
         color: color ?? textPrimary,
         height: height,
         letterSpacing: letterSpacing,
+        fontStyle: fontStyle,
       );
 }

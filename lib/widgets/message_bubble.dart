@@ -198,9 +198,9 @@ class MessageBubble extends StatelessWidget {
               ),
             ),
           if (isStreaming && !hasContent && !hasToolCalls)
-            const Padding(
-              padding: EdgeInsets.only(top: 4, bottom: 4),
-              child: _BlinkingDots(),
+            Padding(
+              padding: const EdgeInsets.only(top: 4, bottom: 4),
+              child: const _BlinkingDots(),
             ),
           if (isError && message.error != null)
             Padding(
@@ -229,6 +229,8 @@ class MessageBubble extends StatelessWidget {
 }
 
 class _BlinkingDots extends StatefulWidget {
+  const _BlinkingDots();
+
   @override
   State<_BlinkingDots> createState() => _BlinkingDotsState();
 }
