@@ -6,12 +6,12 @@ import '../models/qwen_account.dart';
 import '../services/chat_provider.dart';
 import '../theme/app_theme.dart';
 
-/// Tela de configurações:
+/// Tela de configurações.
 /// - Conexão com o proxy (URL + API key)
 /// - Modelo padrão e parâmetros
 /// - System prompt customizado
-/// - Habilitar/desabilitar tools
-/// - Gerenciar contas Qwen (adicionar, editar, remover)
+/// - Lista de tools server-side disponíveis
+/// - Gerenciamento de contas Qwen (adicionar/remover/limpar cooldown/warmup)
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
 
@@ -136,7 +136,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               SnackBar(
                                 content: Text(
                                   provider.proxyOnline
-                                      ? 'Proxy online — ${provider.models.length} modelos disponíveis.'
+                                      ? 'Proxy online — ${provider.models.length} modelos, ${provider.accounts.length} conta(s), ${provider.serverTools.length} tool(s).'
                                       : 'Proxy offline: ${provider.connectionError ?? "erro desconhecido"}',
                                 ),
                                 backgroundColor: provider.proxyOnline
@@ -159,10 +159,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
             ],
           ),
-          const SizedBox(height: 8),
           if (provider.connectionError != null && !provider.proxyOnline)
             Padding(
-              padding: const EdgeInsets.only(top: 4),
+              padding: const EdgeInsets.only(top: 6),
               child: Text(
                 provider.connectionError!,
                 style: TextStyle(color: AppTheme.statusError, fontSize: 12),
@@ -200,7 +199,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
             },
             title: const Text('Habilitar tool calls'),
             subtitle: const Text(
-              'Permite que o modelo chame ferramentas locais (calculator, get_current_time, etc).',
+              'Permite que o modelo chame ferramentas server-side (calculator, '
+              'get_current_time, list_qwen_accounts, http_request, etc).',
             ),
             activeColor: AppTheme.claudeOrange,
           ),
@@ -211,9 +211,37 @@ class _SettingsScreenState extends State<SettingsScreen> {
               _markDirty();
             },
             title: const Text('Streaming SSE'),
-            subtitle: const Text('Receber tokens incrementalmente.'),
+            subtitle: const Text('Receber tokens e tool calls incrementalmente.'),
             activeColor: AppTheme.claudeOrange,
           ),
+          const SizedBox(height: 24),
+          _SectionTitle('Tools server-side disponíveis'),
+          if (provider.serverTools.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: Text(
+                provider.proxyOnline
+                    ? 'Nenhuma tool carregada.'
+                    : 'Conecte ao proxy para carregar.',
+                style: AppTheme.sansTextStyle(color: AppTheme.textMuted, fontSize: 12),
+              ),
+            )
+          else
+            ...provider.serverTools.map((t) => ListTile(
+                  dense: true,
+                  contentPadding: const EdgeInsets.only(left: 4),
+                  leading: Icon(Icons.build_circle, size: 18, color: AppTheme.claudeOrange),
+                  title: Text(
+                    t['name'] as String? ?? '',
+                    style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+                  ),
+                  subtitle: Text(
+                    t['description'] as String? ?? '',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(color: AppTheme.textMuted, fontSize: 11),
+                  ),
+                )),
           const SizedBox(height: 24),
           _SectionTitle('System prompt'),
           TextField(
@@ -228,17 +256,46 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
           ),
           const SizedBox(height: 24),
-          _SectionTitle('Contas Qwen'),
+          _SectionTitle('Contas Qwen no proxy'),
           Padding(
             padding: const EdgeInsets.only(top: 4, bottom: 12),
             child: Text(
-              'Contas usadas pelo proxy QwenBridge para autenticar no chat.qwen.ai. '
-              'As credenciais ficam salvas apenas no device.',
-              style: AppTheme.sansTextStyle(color: AppTheme.textSecondary,
+              'As contas são gerenciadas pelo proxy QwenBridge (SQLite). '
+              'As alterações abaixo são enviadas em runtime via /v1/accounts '
+              'e refletem imediatamente no proxy. As senhas NÃO ficam no app.',
+              style: AppTheme.sansTextStyle(
+                color: AppTheme.textSecondary,
                 fontSize: 12,
-                height: 1.4),
+                height: 1.4,
+              ),
             ),
           ),
+          // Resumo de status
+          if (provider.accounts.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Row(
+                children: [
+                  _StatusChip(
+                    label: '${provider.accounts.length} conta(s)',
+                    color: AppTheme.bgSurfaceAlt,
+                  ),
+                  const SizedBox(width: 6),
+                  _StatusChip(
+                    label: '${provider.accounts.where((a) => !a.inCooldown).length} ativa(s)',
+                    color: AppTheme.statusSuccess.withOpacity(0.2),
+                    textColor: AppTheme.statusSuccess,
+                  ),
+                  const SizedBox(width: 6),
+                  if (provider.accounts.any((a) => a.inCooldown))
+                    _StatusChip(
+                      label: '${provider.accounts.where((a) => a.inCooldown).length} em cooldown',
+                      color: AppTheme.statusWarning.withOpacity(0.2),
+                      textColor: AppTheme.statusWarning,
+                    ),
+                ],
+              ),
+            ),
           ...provider.accounts.map((a) => _AccountTile(account: a)),
           const SizedBox(height: 8),
           Row(
@@ -260,13 +317,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
             ],
           ),
-          const SizedBox(height: 12),
-          if (provider.accounts.isNotEmpty)
-            OutlinedButton.icon(
-              onPressed: () => _showWireStringDialog(context, provider),
-              icon: const Icon(Icons.copy, size: 18),
-              label: const Text('Copiar QWEN_ACCOUNTS para .env do proxy'),
-            ),
           const SizedBox(height: 24),
           _SectionTitle('Sobre'),
           ListTile(
@@ -276,10 +326,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
             title: const Text('QwenCoder v1.0.0'),
             subtitle: Text(
               'Cliente Flutter para o proxy QwenBridge.\n'
-              'Fork: github.com/deivid22srk/QwenBridge-Custom-Version',
-              style: AppTheme.sansTextStyle(color: AppTheme.textSecondary,
+              'Fork: github.com/deivid22srk/QwenBridge-Custom-Version\n'
+              'Repo: github.com/deivid22srk/QwenCoder',
+              style: AppTheme.sansTextStyle(
+                color: AppTheme.textSecondary,
                 fontSize: 12,
-                height: 1.4),
+                height: 1.4,
+              ),
             ),
           ),
           const SizedBox(height: 24),
@@ -345,16 +398,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
   void _showAddAccountDialog(BuildContext context, ChatProvider provider) {
     final emailCtrl = TextEditingController();
     final passCtrl = TextEditingController();
-    final labelCtrl = TextEditingController();
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: AppTheme.bgSurface,
-        title: const Text('Adicionar conta Qwen'),
+        title: const Text('Adicionar conta Qwen no proxy'),
         content: SingleChildScrollView(
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
+              Text(
+                'As credenciais são enviadas ao proxy e armazenadas lá '
+                '(SQLite + Brotli encrypt). O app não guarda a senha.',
+                style: AppTheme.sansTextStyle(color: AppTheme.textSecondary, fontSize: 11),
+              ),
+              const SizedBox(height: 12),
               TextField(
                 controller: emailCtrl,
                 decoration: const InputDecoration(labelText: 'Email'),
@@ -366,14 +424,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 decoration: const InputDecoration(labelText: 'Senha'),
                 obscureText: true,
               ),
-              const SizedBox(height: 10),
-              TextField(
-                controller: labelCtrl,
-                decoration: const InputDecoration(
-                  labelText: 'Rótulo (opcional)',
-                  hintText: 'ex: conta pessoal',
-                ),
-              ),
             ],
           ),
         ),
@@ -383,20 +433,34 @@ class _SettingsScreenState extends State<SettingsScreen> {
             child: const Text('Cancelar'),
           ),
           ElevatedButton(
-            onPressed: () {
+            onPressed: () async {
               final email = emailCtrl.text.trim();
               final pass = passCtrl.text;
               if (email.isEmpty || pass.isEmpty) return;
-              final acc = QwenAccount(
-                id: 'acc_${DateTime.now().microsecondsSinceEpoch}',
-                email: email,
-                password: pass,
-                label: labelCtrl.text.trim().isEmpty ? null : labelCtrl.text.trim(),
-                enabled: true,
-                createdAt: DateTime.now(),
-              );
-              provider.addAccount(acc);
               Navigator.of(ctx).pop();
+              try {
+                final r = await provider.addAccount(email: email, password: pass);
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        r.added > 0
+                            ? '✓ Conta adicionada.'
+                            : r.skipped > 0
+                                ? 'Conta já existe no proxy.'
+                                : 'Falha: ${r.results.firstOrNull?.error ?? "erro"}',
+                      ),
+                      backgroundColor: r.added > 0 ? AppTheme.statusSuccess : AppTheme.statusError,
+                    ),
+                  );
+                }
+              } catch (e) {
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Erro: $e'), backgroundColor: AppTheme.statusError),
+                  );
+                }
+              }
             },
             child: const Text('Adicionar'),
           ),
@@ -411,7 +475,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: AppTheme.bgSurface,
-        title: const Text('Adicionar contas em lote'),
+        title: const Text('Adicionar contas em lote no proxy'),
         content: SizedBox(
           width: double.maxFinite,
           child: Column(
@@ -420,7 +484,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             children: [
               Text(
                 'Cole as contas abaixo. Formatos aceitos (misturáveis):',
-                style: TextStyle(color: AppTheme.textSecondary, fontSize: 12),
+                style: AppTheme.sansTextStyle(color: AppTheme.textSecondary, fontSize: 12),
               ),
               const SizedBox(height: 6),
               Text(
@@ -453,21 +517,29 @@ class _SettingsScreenState extends State<SettingsScreen> {
             child: const Text('Cancelar'),
           ),
           ElevatedButton(
-            onPressed: () {
-              final parsed = _parseBatch(ctrl.text);
-              for (final p in parsed) {
-                provider.addAccount(QwenAccount(
-                  id: 'acc_${DateTime.now().microsecondsSinceEpoch}_${p.email.hashCode.abs()}',
-                  email: p.email,
-                  password: p.password,
-                  enabled: true,
-                  createdAt: DateTime.now(),
-                ));
-              }
+            onPressed: () async {
+              final wire = ctrl.text.trim();
+              if (wire.isEmpty) return;
               Navigator.of(ctx).pop();
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(content: Text('${parsed.length} conta(s) adicionada(s).')),
-              );
+              try {
+                final r = await provider.addAccountsFromWire(wire);
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        '${r.added} adicionada(s) · ${r.skipped} skip · ${r.failed} falha(s)',
+                      ),
+                      backgroundColor: r.failed > 0 ? AppTheme.statusWarning : AppTheme.statusSuccess,
+                    ),
+                  );
+                }
+              } catch (e) {
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Erro: $e'), backgroundColor: AppTheme.statusError),
+                  );
+                }
+              }
             },
             child: const Text('Importar'),
           ),
@@ -475,103 +547,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
     );
   }
-
-  void _showWireStringDialog(BuildContext context, ChatProvider provider) {
-    final wire = provider.buildWireString();
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppTheme.bgSurface,
-        title: const Text('QWEN_ACCOUNTS'),
-        content: SizedBox(
-          width: double.maxFinite,
-          child: SelectableText(
-            wire,
-            style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('Fechar'),
-          ),
-          ElevatedButton.icon(
-            onPressed: () async {
-              await Clipboard.setData(ClipboardData(text: wire));
-              if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Copiado para a área de transferência.')),
-                );
-              }
-              Navigator.of(ctx).pop();
-            },
-            icon: const Icon(Icons.copy, size: 18),
-            label: const Text('Copiar'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  /// Parser de lote — espelha os 4 formatos suportados pelo QwenBridge.
-  List<_ParsedAccount> _parseBatch(String raw) {
-    final result = <_ParsedAccount>[];
-    final seen = <String>{};
-    final lines = raw.split(RegExp(r'\r?\n'));
-    // Formato .env em uma única linha
-    if (lines.length == 1 && lines.first.contains(';')) {
-      for (final part in lines.first.split(';')) {
-        final p = _parseSingle(part);
-        if (p != null && seen.add(p.email)) result.add(p);
-      }
-      return result;
-    }
-    // Demais formatos (linha a linha, ou par de linhas)
-    for (var i = 0; i < lines.length; i++) {
-      final line = lines[i].trim();
-      if (line.isEmpty || line.startsWith('#')) continue;
-      // Tenta email:senha
-      var p = _parseSingle(line);
-      if (p != null) {
-        if (seen.add(p.email)) result.add(p);
-        continue;
-      }
-      // Tenta "email senha"
-      final sp = line.split(RegExp(r'\s+'));
-      if (sp.length >= 2 && sp[0].contains('@')) {
-        final email = sp[0];
-        final pass = sp.sublist(1).join(' ');
-        if (seen.add(email)) result.add(_ParsedAccount(email, pass));
-        continue;
-      }
-      // Tenta par de linhas (email na atual, senha na próxima)
-      if (line.contains('@') && i + 1 < lines.length) {
-        final next = lines[i + 1].trim();
-        if (next.isNotEmpty && !next.contains('@')) {
-          if (seen.add(line)) result.add(_ParsedAccount(line, next));
-          i++; // pula a próxima
-        }
-      }
-    }
-    return result;
-  }
-
-  _ParsedAccount? _parseSingle(String s) {
-    final t = s.trim();
-    if (t.isEmpty) return null;
-    final idx = t.indexOf(':');
-    if (idx <= 0) return null;
-    final email = t.substring(0, idx).trim();
-    final pass = t.substring(idx + 1).trim();
-    if (!email.contains('@') || pass.isEmpty) return null;
-    return _ParsedAccount(email, pass);
-  }
-}
-
-class _ParsedAccount {
-  final String email;
-  final String password;
-  _ParsedAccount(this.email, this.password);
 }
 
 class _SectionTitle extends StatelessWidget {
@@ -584,10 +559,38 @@ class _SectionTitle extends StatelessWidget {
       padding: const EdgeInsets.only(top: 4, bottom: 8),
       child: Text(
         text,
-        style: AppTheme.sansTextStyle(color: AppTheme.claudeOrange,
+        style: AppTheme.sansTextStyle(
+          color: AppTheme.claudeOrange,
           fontWeight: FontWeight.w600,
           fontSize: 12,
-          letterSpacing: 0.6),
+          letterSpacing: 0.6,
+        ),
+      ),
+    );
+  }
+}
+
+class _StatusChip extends StatelessWidget {
+  final String label;
+  final Color color;
+  final Color? textColor;
+  const _StatusChip({required this.label, required this.color, this.textColor});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Text(
+        label,
+        style: AppTheme.sansTextStyle(
+          color: textColor ?? AppTheme.textPrimary,
+          fontSize: 11,
+          fontWeight: FontWeight.w500,
+        ),
       ),
     );
   }
@@ -603,34 +606,65 @@ class _AccountTile extends StatelessWidget {
     return Card(
       child: ListTile(
         leading: Icon(
-          account.enabled ? Icons.check_circle : Icons.cancel,
-          color: account.enabled ? AppTheme.statusSuccess : AppTheme.textMuted,
+          account.inCooldown ? Icons.timer : Icons.check_circle,
+          color: account.inCooldown ? AppTheme.statusWarning : AppTheme.statusSuccess,
           size: 20,
         ),
         title: Text(
           account.email,
           style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
         ),
-        subtitle: Text(
-          [
-            if (account.label != null) account.label!,
-            'adicionada em ${account.createdAt.day.toString().padLeft(2, '0')}/${account.createdAt.month.toString().padLeft(2, '0')}/${account.createdAt.year}',
-          ].join(' • '),
-          style: TextStyle(color: AppTheme.textMuted, fontSize: 11),
-        ),
+        subtitle: account.inCooldown
+            ? Text(
+                'em cooldown · ${account.cooldownReason ?? "—"} · ${_formatRemaining(account.cooldownRemainingMs)}',
+                style: TextStyle(color: AppTheme.statusWarning, fontSize: 11),
+              )
+            : Text(
+                'ativa',
+                style: TextStyle(color: AppTheme.statusSuccess, fontSize: 11),
+              ),
         trailing: PopupMenuButton<String>(
           icon: const Icon(Icons.more_vert, size: 18),
-          onSelected: (v) {
-            if (v == 'toggle') {
-              provider.updateAccount(account.copyWith(enabled: !account.enabled));
-            } else if (v == 'delete') {
-              provider.removeAccount(account.id);
+          onSelected: (v) async {
+            switch (v) {
+              case 'clear_cooldown':
+                await provider.clearAccountCooldown(account.id);
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Cooldown limpo.')),
+                  );
+                }
+                break;
+              case 'warmup':
+                await provider.warmupAccount(account.id);
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Warmup iniciado em background.')),
+                  );
+                }
+                break;
+              case 'delete':
+                final ok = await provider.removeAccount(account.id);
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(ok ? 'Conta removida.' : 'Falha ao remover.'),
+                      backgroundColor: ok ? AppTheme.statusSuccess : AppTheme.statusError,
+                    ),
+                  );
+                }
+                break;
             }
           },
           itemBuilder: (ctx) => [
-            PopupMenuItem(
-              value: 'toggle',
-              child: Text(account.enabled ? 'Desativar' : 'Ativar'),
+            if (account.inCooldown)
+              const PopupMenuItem(
+                value: 'clear_cooldown',
+                child: Text('Limpar cooldown'),
+              ),
+            const PopupMenuItem(
+              value: 'warmup',
+              child: Text('Forçar warmup'),
             ),
             const PopupMenuItem(
               value: 'delete',
@@ -640,5 +674,13 @@ class _AccountTile extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  String _formatRemaining(int? ms) {
+    if (ms == null) return '';
+    final sec = (ms / 1000).round();
+    if (sec < 60) return '${sec}s';
+    final min = sec ~/ 60;
+    return '${min}min';
   }
 }

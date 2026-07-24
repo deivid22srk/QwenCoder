@@ -1,7 +1,9 @@
 import 'package:flutter/foundation.dart';
 import 'tool_call.dart';
+import 'streaming_tool_call.dart';
 
 export 'tool_call.dart' show MessageRole, ToolCall;
+export 'streaming_tool_call.dart' show StreamingToolCall, ToolCallStatus, ToolCallProgressUpdate;
 
 /// Status de uma mensagem no histórico.
 enum MessageStatus {
@@ -13,14 +15,15 @@ enum MessageStatus {
 }
 
 /// Uma mensagem no histórico de chat.
-/// Suporta conteúdo textual, chamadas de ferramenta (assistant) e
-/// resultados de ferramenta (tool).
+/// Suporta conteúdo textual, chamadas de ferramenta (assistant) com
+/// streaming em tempo real, e resultados de ferramenta (tool).
 @immutable
 class ChatMessage {
   final String id;
   final MessageRole role;
   final String content;
   final List<ToolCall> toolCalls;
+  final List<StreamingToolCall> streamingToolCalls;
   final String? toolCallId;
   final String? toolName;
   final MessageStatus status;
@@ -33,6 +36,7 @@ class ChatMessage {
     required this.role,
     required this.content,
     this.toolCalls = const [],
+    this.streamingToolCalls = const [],
     this.toolCallId,
     this.toolName,
     this.status = MessageStatus.complete,
@@ -46,6 +50,7 @@ class ChatMessage {
     MessageRole? role,
     String? content,
     List<ToolCall>? toolCalls,
+    List<StreamingToolCall>? streamingToolCalls,
     String? toolCallId,
     String? toolName,
     MessageStatus? status,
@@ -58,6 +63,7 @@ class ChatMessage {
         role: role ?? this.role,
         content: content ?? this.content,
         toolCalls: toolCalls ?? this.toolCalls,
+        streamingToolCalls: streamingToolCalls ?? this.streamingToolCalls,
         toolCallId: toolCallId ?? this.toolCallId,
         toolName: toolName ?? this.toolName,
         status: status ?? this.status,
@@ -73,13 +79,12 @@ class ChatMessage {
         createdAt: DateTime.now(),
       );
 
-  factory ChatMessage.assistant({String content = '', List<ToolCall> toolCalls = const []}) => ChatMessage(
+  factory ChatMessage.assistant({String content = ''}) => ChatMessage(
         id: _uuid(),
         role: MessageRole.assistant,
         content: content,
-        toolCalls: toolCalls,
         createdAt: DateTime.now(),
-        status: toolCalls.isEmpty ? MessageStatus.streaming : MessageStatus.toolRunning,
+        status: MessageStatus.streaming,
       );
 
   factory ChatMessage.tool({
@@ -114,16 +119,16 @@ class ChatMessage {
       );
 
   /// Converte para o formato JSON esperado pela API OpenAI-compatible.
+  /// Importante: o proxy agora executa tools server-side, então o cliente
+  /// NÃO envia tool_results manualmente — apenas as mensagens user/assistant/system.
   Map<String, dynamic> toApiJson() {
     final Map<String, dynamic> j = {
       'role': role.wire,
     };
     if (role == MessageRole.tool) {
+      // Não enviamos tool messages para o proxy — ele gerencia isso server-side
       j['content'] = content;
       j['tool_call_id'] = toolCallId;
-    } else if (role == MessageRole.assistant && toolCalls.isNotEmpty) {
-      j['content'] = content.isEmpty ? null : content;
-      j['tool_calls'] = toolCalls.map((t) => t.toJson()).toList();
     } else {
       j['content'] = content;
     }

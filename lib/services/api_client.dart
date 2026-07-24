@@ -3,13 +3,20 @@ import 'dart:convert';
 import 'package:dio/dio.dart';
 import '../models/chat_message.dart';
 import '../models/tool_call.dart';
-import 'tool_executor.dart';
+import '../models/qwen_account.dart';
+import '../models/streaming_tool_call.dart';
 
-/// Cliente da API OpenAI-compatible do proxy QwenBridge.
+/// Cliente da API do proxy QwenBridge.
 ///
 /// Endpoints consumidos:
-/// - `POST /v1/chat/completions` (com `stream: true` por padrão)
+/// - `POST /v1/chat/completions` (streaming SSE com eventos extras de tool_call)
 /// - `GET  /v1/models`
+/// - `GET  /v1/accounts`
+/// - `POST /v1/accounts`
+/// - `DELETE /v1/accounts/:id`
+/// - `PATCH /v1/accounts/:id` (clear_cooldown | warmup)
+/// - `GET  /v1/accounts/stream` (SSE de mudanças de status)
+/// - `GET  /v1/tools`
 /// - `GET  /health`
 class ApiClient {
   ApiClient({required String baseUrl, String apiKey = ''})
@@ -72,38 +79,150 @@ class ApiClient {
     }
   }
 
+  /// Lista tools server-side disponíveis no proxy (endpoint /v1/tools).
+  Future<List<Map<String, dynamic>>> listServerTools() async {
+    try {
+      final r = await Dio(BaseOptions(
+        baseUrl: _baseUrl,
+        headers: {
+          if (_apiKey.isNotEmpty) 'Authorization': 'Bearer $_apiKey',
+        },
+        responseType: ResponseType.json,
+      )).get<Map<String, dynamic>>('/v1/tools');
+      final list = r.data?['tools'] as List? ?? [];
+      return list
+          .map((t) => Map<String, dynamic>.from(t as Map))
+          .toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  // ============ ACCOUNTS API ============
+
+  /// `GET /v1/accounts` — lista contas (sem senhas).
+  Future<AccountsSnapshot> listAccounts() async {
+    final r = await _jsonGet('/v1/accounts');
+    return AccountsSnapshot.fromJson(r);
+  }
+
+  /// `POST /v1/accounts` — adiciona uma conta.
+  Future<AddAccountsResult> addAccount({required String email, required String password}) async {
+    final r = await _jsonPost('/v1/accounts', {'email': email, 'password': password});
+    return AddAccountsResult.fromJson(r);
+  }
+
+  /// `POST /v1/accounts` — adiciona várias contas (batch).
+  Future<AddAccountsResult> addAccountsBatch(List<({String email, String password})> accounts) async {
+    final r = await _jsonPost('/v1/accounts', {
+      'accounts': accounts.map((a) => {'email': a.email, 'password': a.password}).toList(),
+    });
+    return AddAccountsResult.fromJson(r);
+  }
+
+  /// `POST /v1/accounts` — adiciona via string wire `email:pass;email:pass`.
+  Future<AddAccountsResult> addAccountsFromWire(String wire) async {
+    final r = await _jsonPost('/v1/accounts', {'wire': wire});
+    return AddAccountsResult.fromJson(r);
+  }
+
+  /// `DELETE /v1/accounts/:id`
+  Future<bool> removeAccount(String id) async {
+    final r = await Dio(BaseOptions(
+      baseUrl: _baseUrl,
+      headers: {
+        'Content-Type': 'application/json',
+        if (_apiKey.isNotEmpty) 'Authorization': 'Bearer $_apiKey',
+      },
+      responseType: ResponseType.json,
+    )).delete<Map<String, dynamic>>('/v1/accounts/$id');
+    return r.statusCode == 200 && (r.data?['ok'] == true);
+  }
+
+  /// `PATCH /v1/accounts/:id` com action `clear_cooldown` ou `warmup`.
+  Future<bool> patchAccount(String id, {required String action}) async {
+    final r = await Dio(BaseOptions(
+      baseUrl: _baseUrl,
+      headers: {
+        'Content-Type': 'application/json',
+        if (_apiKey.isNotEmpty) 'Authorization': 'Bearer $_apiKey',
+      },
+      responseType: ResponseType.json,
+    )).patch<Map<String, dynamic>>('/v1/accounts/$id', data: {'action': action});
+    return r.statusCode == 200 && (r.data?['ok'] == true);
+  }
+
+  /// `GET /v1/accounts/stream` — SSE de mudanças de status em tempo real.
+  /// Emite um evento a cada snapshot/heartbeat recebido do proxy.
+  Stream<AccountsSnapshot> streamAccounts() async* {
+    final resp = await _dio.get<ResponseBody>(
+      '/v1/accounts/stream',
+      options: Options(responseType: ResponseType.stream, headers: {'Accept': 'text/event-stream'}),
+    );
+    final stream = resp.data?.stream;
+    if (stream == null) return;
+    final lineBuf = StringBuffer();
+    await for (final chunk in stream) {
+      lineBuf.write(utf8.decode(chunk, allowMalformed: true));
+      final raw = lineBuf.toString();
+      if (!raw.contains('\n')) continue;
+      final lines = raw.split('\n');
+      lineBuf.clear();
+      lineBuf.write(lines.removeLast());
+      String? eventName;
+      for (final line in lines) {
+        final trimmed = line.trim();
+        if (trimmed.isEmpty) {
+          // Fim de evento — se tínhamos data, processa
+          eventName = null;
+          continue;
+        }
+        if (trimmed.startsWith('event:')) {
+          eventName = trimmed.substring(6).trim();
+        } else if (trimmed.startsWith('data:')) {
+          final payload = trimmed.substring(5).trim();
+          if (eventName == 'snapshot' || eventName == 'heartbeat') {
+            try {
+              final j = jsonDecode(payload) as Map<String, dynamic>;
+              final accs = j['accounts'];
+              if (accs is List) {
+                yield AccountsSnapshot.fromJson({
+                  'total': accs.length,
+                  'active': accs.where((a) => !(a as Map)['in_cooldown']).length,
+                  'in_cooldown': accs.where((a) => (a as Map)['in_cooldown']).length,
+                  'accounts': accs,
+                });
+              }
+            } catch (_) {}
+          }
+        }
+      }
+    }
+  }
+
+  // ============ CHAT (SSE RICO) ============
+
   /// Envia uma requisição de chat completion com streaming SSE.
-  ///
-  /// Emite eventos de três tipos:
-  /// - `ChatStreamEvent.delta(String text)` — texto incremental da resposta
-  /// - `ChatStreamEvent.toolCalls(List<ToolCall> calls)` — chamadas de ferramenta finalizadas
-  /// - `ChatStreamEvent.done(String? finishReason)` — fim do stream
-  /// - `ChatStreamEvent.error(String message)` — erro
+  /// O proxy executa tools server-side e emite eventos extras:
+  /// `tool_call.start`, `tool_call.args_delta`, `tool_call.execute.start`,
+  /// `tool_call.execute.progress`, `tool_call.execute.complete`,
+  /// `tool_call.result`, `tool_call.loop`.
   Stream<ChatStreamEvent> chatStream({
     required String model,
     required List<ChatMessage> messages,
     double temperature = 0.7,
-    bool enableTools = true,
-    String? toolChoice,
   }) async* {
     final body = <String, dynamic>{
       'model': model,
       'messages': _buildMessagesPayload(messages),
       'stream': true,
       'temperature': temperature,
+      // Habilita tools server-side (interceptor do proxy).
+      'enable_tools': true,
     };
-    if (enableTools) {
-      body['tools'] = ToolExecutor.allDefinitions().map((t) => t.toApiJson()).toList();
-      if (toolChoice != null) {
-        body['tool_choice'] = toolChoice;
-      } else {
-        body['tool_choice'] = 'auto';
-      }
-    }
 
-    final accumulators = <String, _ToolCallAcc>{};
-    final contentBuf = StringBuffer();
     String? finishReason;
+    final toolCallsAcc = <String, _ToolCallAcc>{};
 
     try {
       final resp = await _dio.post<ResponseBody>(
@@ -118,31 +237,118 @@ class ApiClient {
         return;
       }
 
-      // Buffer para juntar chunks SSE que chegam fragmentados.
       final lineBuf = StringBuffer();
+      String? currentEventName;
+
       await for (final chunk in stream) {
         final decoded = utf8.decode(chunk, allowMalformed: true);
         lineBuf.write(decoded);
         final raw = lineBuf.toString();
         if (!raw.contains('\n')) continue;
         final lines = raw.split('\n');
-        // Mantém última linha parcial no buffer
         lineBuf.clear();
         lineBuf.write(lines.removeLast());
 
         for (final line in lines) {
           final trimmed = line.trim();
-          if (trimmed.isEmpty) continue;
+          if (trimmed.isEmpty) {
+            // Event boundary — reset event name
+            currentEventName = null;
+            continue;
+          }
+          if (trimmed.startsWith('event:')) {
+            currentEventName = trimmed.substring(6).trim();
+            continue;
+          }
           if (!trimmed.startsWith('data:')) continue;
           final payload = trimmed.substring(5).trim();
           if (payload == '[DONE]') {
+            // Emite tool_calls finais (se houver acumulado)
+            if (toolCallsAcc.isNotEmpty) {
+              yield ChatStreamEvent.toolCalls(
+                toolCallsAcc.values.map((a) => a.toToolCall()).toList(),
+              );
+            }
             yield ChatStreamEvent.done(finishReason);
             return;
           }
+
           try {
             final json = jsonDecode(payload) as Map<String, dynamic>;
+
+            // Eventos extras do interceptor
+            switch (currentEventName) {
+              case 'tool_call.start':
+                yield ChatStreamEvent.toolCallStart(
+                  toolCallId: json['tool_call_id'] as String,
+                  name: json['name'] as String,
+                  iteration: (json['iteration'] as num?)?.toInt() ?? 1,
+                );
+                continue;
+              case 'tool_call.args_delta':
+                final id = json['tool_call_id'] as String;
+                final name = json['name'] as String;
+                final delta = json['delta'] as String;
+                final acc = toolCallsAcc.putIfAbsent(id, () => _ToolCallAcc()..id = id..name = name);
+                acc.argsBuf.write(delta);
+                yield ChatStreamEvent.toolCallArgsDelta(
+                  toolCallId: id,
+                  name: name,
+                  delta: delta,
+                );
+                continue;
+              case 'tool_call.execute.start':
+                yield ChatStreamEvent.toolCallExecuteStart(
+                  toolCallId: json['tool_call_id'] as String,
+                  name: json['name'] as String,
+                  startedAt: DateTime.fromMillisecondsSinceEpoch(
+                    (json['started_at'] as num?)?.toInt() ?? DateTime.now().millisecondsSinceEpoch,
+                  ),
+                );
+                continue;
+              case 'tool_call.execute.progress':
+                yield ChatStreamEvent.toolCallProgress(
+                  toolCallId: json['tool_call_id'] as String,
+                  name: json['name'] as String,
+                  message: json['message'] as String? ?? '',
+                  percent: (json['percent'] as num?)?.toInt(),
+                  data: json['data'] as Map<String, dynamic>?,
+                );
+                continue;
+              case 'tool_call.execute.complete':
+                yield ChatStreamEvent.toolCallExecuteComplete(
+                  toolCallId: json['tool_call_id'] as String,
+                  name: json['name'] as String,
+                  success: (json['success'] as bool?) ?? true,
+                  durationMs: (json['duration_ms'] as num?)?.toInt() ?? 0,
+                  resultLength: (json['result_length'] as num?)?.toInt() ?? 0,
+                );
+                continue;
+              case 'tool_call.result':
+                yield ChatStreamEvent.toolCallResult(
+                  toolCallId: json['tool_call_id'] as String,
+                  name: json['name'] as String,
+                  content: json['content'] as String,
+                  isError: (json['is_error'] as bool?) ?? false,
+                  durationMs: (json['duration_ms'] as num?)?.toInt() ?? 0,
+                );
+                continue;
+              case 'tool_call.loop':
+                yield ChatStreamEvent.toolCallLoop(
+                  iteration: (json['iteration'] as num?)?.toInt() ?? 0,
+                );
+                continue;
+              case 'error':
+                final errMsg = json['error'] is Map
+                    ? (json['error']['message'] ?? json['error'].toString())
+                    : json['error'].toString();
+                yield ChatStreamEvent.error(errMsg.toString());
+                return;
+            }
+
+            // Evento OpenAI padrão (sem nome, ou `data:` direto)
             if (json.containsKey('error')) {
-              final errMsg = (json['error'] is Map)
+              final errMsg = json['error'] is Map
                   ? (json['error']['message'] ?? json['error'].toString())
                   : json['error'].toString();
               yield ChatStreamEvent.error(errMsg.toString());
@@ -155,15 +361,15 @@ class ApiClient {
             if (delta != null) {
               if (delta['content'] is String) {
                 final piece = delta['content'] as String;
-                contentBuf.write(piece);
                 yield ChatStreamEvent.delta(piece);
               }
+              // Acumula tool_calls no formato OpenAI (compat)
               final tcList = delta['tool_calls'] as List?;
               if (tcList != null) {
                 for (final tcRaw in tcList) {
                   final tc = tcRaw as Map<String, dynamic>;
                   final idx = (tc['index'] as num?)?.toInt() ?? 0;
-                  final acc = accumulators.putIfAbsent(idx.toString(), () => _ToolCallAcc());
+                  final acc = toolCallsAcc.putIfAbsent(idx.toString(), () => _ToolCallAcc());
                   if (tc['id'] is String) acc.id = tc['id'] as String;
                   final fn = tc['function'] as Map<String, dynamic>?;
                   if (fn != null) {
@@ -177,21 +383,22 @@ class ApiClient {
               finishReason = choice['finish_reason'] as String;
             }
           } catch (_) {
-            // Ignora payload não-JSON (ex: comentários SSE)
+            // Ignora payload não-JSON
           }
         }
       }
-      // Stream fechou sem [DONE] — emite done com o finishReason visto.
-      if (accumulators.isNotEmpty) {
-        yield ChatStreamEvent.toolCalls(accumulators.values.map((a) => a.toToolCall()).toList());
+      // Stream fechou sem [DONE]
+      if (toolCallsAcc.isNotEmpty) {
+        yield ChatStreamEvent.toolCalls(
+          toolCallsAcc.values.map((a) => a.toToolCall()).toList(),
+        );
       }
       yield ChatStreamEvent.done(finishReason);
     } on DioException catch (e) {
       final data = e.response?.data;
       String msg = e.message ?? 'Dio error';
       if (data is List) {
-        // dio retorna List<dynamic>; utf8.decode espera List<int>
-        final bytes = (data as List).whereType<int>().toList(growable: false);
+        final bytes = data.whereType<int>().toList(growable: false);
         if (bytes.isNotEmpty) {
           msg = utf8.decode(bytes, allowMalformed: true);
         }
@@ -206,23 +413,34 @@ class ApiClient {
     }
   }
 
-  /// Modo não-streaming (fallback).
-  Future<ChatCompletionResult> chatOnce({
-    required String model,
-    required List<ChatMessage> messages,
-    double temperature = 0.7,
-    bool enableTools = true,
-  }) async {
-    final body = <String, dynamic>{
-      'model': model,
-      'messages': _buildMessagesPayload(messages),
-      'stream': false,
-      'temperature': temperature,
-    };
-    if (enableTools) {
-      body['tools'] = ToolExecutor.allDefinitions().map((t) => t.toApiJson()).toList();
-      body['tool_choice'] = 'auto';
-    }
+  List<Map<String, dynamic>> _buildMessagesPayload(List<ChatMessage> messages) {
+    // Filtra só user/system/assistant — o proxy gerencia tool_results server-side
+    return messages
+        .where((m) =>
+            m.status != MessageStatus.error &&
+            m.content.isNotEmpty &&
+            (m.role == MessageRole.user ||
+             m.role == MessageRole.system ||
+             m.role == MessageRole.assistant))
+        .map((m) => m.toApiJson())
+        .toList();
+  }
+
+  // ============ Helpers JSON ============
+
+  Future<Map<String, dynamic>> _jsonGet(String path) async {
+    final r = await Dio(BaseOptions(
+      baseUrl: _baseUrl,
+      headers: {
+        if (_apiKey.isNotEmpty) 'Authorization': 'Bearer $_apiKey',
+      },
+      responseType: ResponseType.json,
+      receiveTimeout: const Duration(seconds: 15),
+    )).get<Map<String, dynamic>>(path);
+    return r.data ?? {};
+  }
+
+  Future<Map<String, dynamic>> _jsonPost(String path, Map<String, dynamic> body) async {
     final r = await Dio(BaseOptions(
       baseUrl: _baseUrl,
       headers: {
@@ -230,38 +448,27 @@ class ApiClient {
         if (_apiKey.isNotEmpty) 'Authorization': 'Bearer $_apiKey',
       },
       responseType: ResponseType.json,
-      receiveTimeout: const Duration(minutes: 5),
-    )).post<Map<String, dynamic>>('/v1/chat/completions', data: body);
-
-    final data = r.data!;
-    final choice = (data['choices'] as List).first as Map<String, dynamic>;
-    final msg = choice['message'] as Map<String, dynamic>;
-    final content = (msg['content'] as String?) ?? '';
-    final toolCalls = (msg['tool_calls'] as List?)
-            ?.map((t) => ToolCall.fromJson(t as Map<String, dynamic>))
-            .toList() ??
-        const [];
-    return ChatCompletionResult(content: content, toolCalls: toolCalls);
-  }
-
-  List<Map<String, dynamic>> _buildMessagesPayload(List<ChatMessage> messages) {
-    return messages.where((m) {
-      // Skip mensagens de erro (não vão para a API)
-      if (m.status == MessageStatus.error) return false;
-      // Skip mensagens vazias
-      if (m.content.isEmpty && m.toolCalls.isEmpty) return false;
-      return true;
-    }).map((m) => m.toApiJson()).toList();
+      receiveTimeout: const Duration(seconds: 30),
+    )).post<Map<String, dynamic>>(path, data: body);
+    return r.data ?? {};
   }
 }
 
 /// Eventos emitidos pelo stream de chat.
+/// Inclui eventos OpenAI padrão + eventos extras do interceptor do proxy.
 sealed class ChatStreamEvent {
   const ChatStreamEvent();
   const factory ChatStreamEvent.delta(String text) = ChatDeltaEvent;
   const factory ChatStreamEvent.toolCalls(List<ToolCall> calls) = ChatToolCallsEvent;
   const factory ChatStreamEvent.done(String? finishReason) = ChatDoneEvent;
   const factory ChatStreamEvent.error(String message) = ChatErrorEvent;
+  const factory ChatStreamEvent.toolCallStart({required String toolCallId, required String name, required int iteration}) = ToolCallStartEvent;
+  const factory ChatStreamEvent.toolCallArgsDelta({required String toolCallId, required String name, required String delta}) = ToolCallArgsDeltaEvent;
+  const factory ChatStreamEvent.toolCallExecuteStart({required String toolCallId, required String name, required DateTime startedAt}) = ToolCallExecuteStartEvent;
+  const factory ChatStreamEvent.toolCallProgress({required String toolCallId, required String name, required String message, int? percent, Map<String, dynamic>? data}) = ToolCallProgressEvent;
+  const factory ChatStreamEvent.toolCallExecuteComplete({required String toolCallId, required String name, required bool success, required int durationMs, required int resultLength}) = ToolCallExecuteCompleteEvent;
+  const factory ChatStreamEvent.toolCallResult({required String toolCallId, required String name, required String content, required bool isError, required int durationMs}) = ToolCallResultEvent;
+  const factory ChatStreamEvent.toolCallLoop({required int iteration}) = ToolCallLoopEvent;
 }
 
 class ChatDeltaEvent extends ChatStreamEvent {
@@ -284,10 +491,57 @@ class ChatErrorEvent extends ChatStreamEvent {
   const ChatErrorEvent(this.message);
 }
 
-class ChatCompletionResult {
+class ToolCallStartEvent extends ChatStreamEvent {
+  final String toolCallId;
+  final String name;
+  final int iteration;
+  const ToolCallStartEvent({required this.toolCallId, required this.name, required this.iteration});
+}
+
+class ToolCallArgsDeltaEvent extends ChatStreamEvent {
+  final String toolCallId;
+  final String name;
+  final String delta;
+  const ToolCallArgsDeltaEvent({required this.toolCallId, required this.name, required this.delta});
+}
+
+class ToolCallExecuteStartEvent extends ChatStreamEvent {
+  final String toolCallId;
+  final String name;
+  final DateTime startedAt;
+  const ToolCallExecuteStartEvent({required this.toolCallId, required this.name, required this.startedAt});
+}
+
+class ToolCallProgressEvent extends ChatStreamEvent {
+  final String toolCallId;
+  final String name;
+  final String message;
+  final int? percent;
+  final Map<String, dynamic>? data;
+  const ToolCallProgressEvent({required this.toolCallId, required this.name, required this.message, this.percent, this.data});
+}
+
+class ToolCallExecuteCompleteEvent extends ChatStreamEvent {
+  final String toolCallId;
+  final String name;
+  final bool success;
+  final int durationMs;
+  final int resultLength;
+  const ToolCallExecuteCompleteEvent({required this.toolCallId, required this.name, required this.success, required this.durationMs, required this.resultLength});
+}
+
+class ToolCallResultEvent extends ChatStreamEvent {
+  final String toolCallId;
+  final String name;
   final String content;
-  final List<ToolCall> toolCalls;
-  const ChatCompletionResult({required this.content, required this.toolCalls});
+  final bool isError;
+  final int durationMs;
+  const ToolCallResultEvent({required this.toolCallId, required this.name, required this.content, required this.isError, required this.durationMs});
+}
+
+class ToolCallLoopEvent extends ChatStreamEvent {
+  final int iteration;
+  const ToolCallLoopEvent({required this.iteration});
 }
 
 class _ToolCallAcc {
@@ -295,30 +549,19 @@ class _ToolCallAcc {
   String name = '';
   final StringBuffer argsBuf = StringBuffer();
 
-  ToolCall toToolCall() => ToolCall(
-        id: id,
-        name: name,
-        arguments: _parseLooseArgs(argsBuf.toString()),
-      );
-
-  static Map<String, dynamic> _parseLooseArgs(String s) {
-    final trimmed = s.trim();
-    if (trimmed.isEmpty) return {};
+  ToolCall toToolCall() {
+    Map<String, dynamic> args;
     try {
-      final d = jsonDecode(trimmed);
-      if (d is Map) return Map<String, dynamic>.from(d);
-    } catch (_) {}
-    final cleaned = trimmed.replaceAll(RegExp(r',\s*([}\]])'), r'$1');
-    try {
-      final d = jsonDecode(cleaned);
-      if (d is Map) return Map<String, dynamic>.from(d);
-    } catch (_) {}
-    final s2 = trimmed.replaceAll("'", '"');
-    try {
-      final d = jsonDecode(s2);
-      if (d is Map) return Map<String, dynamic>.from(d);
-    } catch (_) {}
-    // Fallback final — devolve o conteúdo cru em _raw
-    return {'_raw': trimmed};
+      args = Map<String, dynamic>.from(jsonDecode(argsBuf.toString()));
+    } catch (_) {
+      try {
+        args = Map<String, dynamic>.from(
+          jsonDecode(argsBuf.toString().replaceAll(RegExp(r',\s*([}\]])'), r'$1')),
+        );
+      } catch (_) {
+        args = {'_raw': argsBuf.toString()};
+      }
+    }
+    return ToolCall(id: id, name: name, arguments: args);
   }
 }

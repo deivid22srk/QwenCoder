@@ -3,7 +3,7 @@ import 'package:qwencoder/models/chat_message.dart';
 import 'package:qwencoder/models/tool_call.dart';
 import 'package:qwencoder/models/qwen_account.dart';
 import 'package:qwencoder/models/app_settings.dart';
-import 'package:qwencoder/services/tool_executor.dart';
+import 'package:qwencoder/models/streaming_tool_call.dart';
 
 void main() {
   group('Models', () {
@@ -14,7 +14,7 @@ void main() {
       expect(m.id, isNotEmpty);
     });
 
-    test('ChatMessage.toApiJson for user', () {
+    test('ChatMessage.toApiJson for user — sem tool_calls (proxy gerencia server-side)', () {
       final m = ChatMessage.user('hi');
       final j = m.toApiJson();
       expect(j['role'], 'user');
@@ -22,29 +22,21 @@ void main() {
       expect(j.containsKey('tool_calls'), isFalse);
     });
 
-    test('ChatMessage.toApiJson for tool result', () {
-      final m = ChatMessage.tool(
-        toolCallId: 'call_123',
-        toolName: 'calculator',
-        content: '{"result": 42}',
-      );
-      final j = m.toApiJson();
-      expect(j['role'], 'tool');
-      expect(j['content'], '{"result": 42}');
-      expect(j['tool_call_id'], 'call_123');
-    });
-
-    test('ChatMessage.toApiJson for assistant with tool calls', () {
-      final m = ChatMessage.assistant(
-        content: '',
-        toolCalls: [
-          ToolCall(id: 'call_1', name: 'get_time', arguments: {}),
-        ],
-      );
-      final j = m.toApiJson();
-      expect(j['role'], 'assistant');
-      expect(j['tool_calls'], isA<List>());
-      expect((j['tool_calls'] as List).length, 1);
+    test('ChatMessage.assistant com streamingToolCalls', () {
+      final m = ChatMessage.assistant(content: 'hello')
+          .copyWith(
+            streamingToolCalls: [
+              const StreamingToolCall(
+                id: 'tc1',
+                name: 'calculator',
+                status: ToolCallStatus.completed,
+                durationMs: 42,
+              ),
+            ],
+          );
+      expect(m.streamingToolCalls.length, 1);
+      expect(m.streamingToolCalls.first.name, 'calculator');
+      expect(m.streamingToolCalls.first.status, ToolCallStatus.completed);
     });
 
     test('ToolCall.fromJson parses OpenAI format', () {
@@ -62,115 +54,78 @@ void main() {
       expect(tc.arguments['expression'], '2+2');
     });
 
-    test('QwenAccount.toWireFormat produces email:senha', () {
-      final a = QwenAccount(
-        id: 'acc_1',
-        email: 'foo@bar.com',
-        password: 'pass123',
-        enabled: true,
-        createdAt: DateTime(2026, 1, 1),
-      );
-      expect(a.toWireFormat(), 'foo@bar.com:pass123');
+    test('QwenAccount.fromJson parseia campos do proxy', () {
+      final j = {
+        'id': 'acc1',
+        'email': 'foo@bar.com',
+        'enabled': true,
+        'cooldown_until': 1700000000000,
+        'cooldown_reason': 'quota_exceeded',
+        'cooldown_remaining_ms': 60000,
+        'in_cooldown': true,
+      };
+      final a = QwenAccount.fromJson(j);
+      expect(a.id, 'acc1');
+      expect(a.email, 'foo@bar.com');
+      expect(a.inCooldown, isTrue);
+      expect(a.cooldownRemainingMs, 60000);
+      expect(a.cooldownReason, 'quota_exceeded');
     });
 
-    test('AppSettings defaults are sensible', () {
+    test('AccountsSnapshot.fromJson parseia lista', () {
+      final j = {
+        'total': 2,
+        'active': 1,
+        'in_cooldown': 1,
+        'accounts': [
+          {'id': 'a1', 'email': 'u1@x.com', 'in_cooldown': false},
+          {'id': 'a2', 'email': 'u2@x.com', 'in_cooldown': true, 'cooldown_until': 1},
+        ],
+      };
+      final snap = AccountsSnapshot.fromJson(j);
+      expect(snap.total, 2);
+      expect(snap.active, 1);
+      expect(snap.inCooldown, 1);
+      expect(snap.accounts.length, 2);
+    });
+
+    test('AddAccountsResult.fromJson parseia resultado de batch', () {
+      final j = {
+        'added': 2,
+        'skipped': 1,
+        'failed': 0,
+        'results': [
+          {'email': 'a@x.com', 'status': 'ok', 'id': '1'},
+          {'email': 'b@x.com', 'status': 'ok', 'id': '2'},
+          {'email': 'c@x.com', 'status': 'skip', 'error': 'already exists'},
+        ],
+      };
+      final r = AddAccountsResult.fromJson(j);
+      expect(r.added, 2);
+      expect(r.skipped, 1);
+      expect(r.failed, 0);
+      expect(r.results.length, 3);
+      expect(r.results.first.status, 'ok');
+      expect(r.results.last.status, 'skip');
+    });
+
+    test('StreamingToolCall copyWith preserva imutabilidade', () {
+      const tc = StreamingToolCall(id: 'tc1', name: 'calc');
+      final tc2 = tc.copyWith(
+        status: ToolCallStatus.executing,
+        argsBuffer: '{"expr":"1+1"}',
+      );
+      expect(tc.status, ToolCallStatus.receivingArgs); // original intacto
+      expect(tc2.status, ToolCallStatus.executing);
+      expect(tc2.argsBuffer, '{"expr":"1+1"}');
+    });
+
+    test('AppSettings defaults são sensatos', () {
       const s = AppSettings();
       expect(s.proxyBaseUrl, 'http://10.0.2.2:3000');
       expect(s.streaming, isTrue);
       expect(s.enableTools, isTrue);
       expect(s.temperature, 0.7);
-    });
-  });
-
-  group('ToolExecutor', () {
-    test('calculator computes simple expression', () {
-      final r = ToolExecutor.execute('calculator', {'expression': '2+3*4'});
-      expect(r.isError, isFalse);
-      // result must contain 14 (2+12)
-      expect(r.content, contains('14'));
-    });
-
-    test('calculator supports parentheses and power', () {
-      final r = ToolExecutor.execute('calculator', {'expression': '(2+3)^2'});
-      expect(r.isError, isFalse);
-      expect(r.content, contains('25'));
-    });
-
-    test('calculator supports sqrt', () {
-      final r = ToolExecutor.execute('calculator', {'expression': 'sqrt(16)'});
-      expect(r.isError, isFalse);
-      expect(r.content, contains('4'));
-    });
-
-    test('calculator rejects invalid characters', () {
-      final r = ToolExecutor.execute('calculator', {'expression': 'print("x")'});
-      expect(r.isError, isTrue);
-    });
-
-    test('get_current_time returns ISO-8601', () {
-      final r = ToolExecutor.execute('get_current_time', {});
-      expect(r.isError, isFalse);
-      expect(r.content, contains('iso8601'));
-    });
-
-    test('random_number respects range', () {
-      for (var i = 0; i < 50; i++) {
-        final r = ToolExecutor.execute('random_number', {'min': 10, 'max': 20});
-        expect(r.isError, isFalse);
-        // parse value
-        final valueRegex = RegExp(r'"value":\s*(\d+)');
-        final m = valueRegex.firstMatch(r.content);
-        expect(m, isNotNull);
-        final v = int.parse(m!.group(1)!);
-        expect(v, greaterThanOrEqualTo(10));
-        expect(v, lessThanOrEqualTo(20));
-      }
-    });
-
-    test('text_transform uppercase', () {
-      final r = ToolExecutor.execute('text_transform', {'text': 'hello', 'operation': 'uppercase'});
-      expect(r.isError, isFalse);
-      expect(r.content, contains('HELLO'));
-    });
-
-    test('text_transform base64 round-trip', () {
-      final enc = ToolExecutor.execute('text_transform', {'text': 'QwenCoder', 'operation': 'base64_encode'});
-      expect(enc.isError, isFalse);
-      final encodedRegex = RegExp(r'"output":\s*"([^"]+)"');
-      final encoded = encodedRegex.firstMatch(enc.content)!.group(1)!;
-      final dec = ToolExecutor.execute('text_transform', {'text': encoded, 'operation': 'base64_decode'});
-      expect(dec.isError, isFalse);
-      expect(dec.content, contains('QwenCoder'));
-    });
-
-    test('device_info returns platform', () {
-      final r = ToolExecutor.execute('device_info', {});
-      expect(r.isError, isFalse);
-      // In test environment platform is one of: linux, macos, windows
-      expect(r.content, contains('platform'));
-    });
-
-    test('get_weather returns mock data', () {
-      final r = ToolExecutor.execute('get_weather', {'city': 'São Paulo'});
-      expect(r.isError, isFalse);
-      expect(r.content, contains('São Paulo'));
-      expect(r.content, contains('temperature_c'));
-    });
-
-    test('unknown tool returns error', () {
-      final r = ToolExecutor.execute('foobar', {});
-      expect(r.isError, isTrue);
-    });
-
-    test('allDefinitions returns non-empty list with proper schema', () {
-      final defs = ToolExecutor.allDefinitions();
-      expect(defs.length, greaterThan(3));
-      for (final d in defs) {
-        final j = d.toApiJson();
-        expect(j['type'], 'function');
-        expect((j['function'] as Map)['name'], d.name);
-        expect((j['function'] as Map)['parameters'], isNotNull);
-      }
     });
   });
 }

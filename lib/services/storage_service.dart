@@ -1,13 +1,14 @@
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/app_settings.dart';
-import '../models/qwen_account.dart';
 
-/// Persistência local de configurações e contas Qwen.
-/// Usa SharedPreferences para simplicidade — os dados ficam no sandbox do app.
+/// Persistência local de configurações do app.
+///
+/// IMPORTANTE: as contas Qwen não são mais persistidas localmente —
+/// elas vivem no banco SQLite do proxy QwenBridge. O app apenas consulta
+/// via `/v1/accounts` e recebe updates em tempo real via `/v1/accounts/stream`.
 class StorageService {
   static const _kSettings = 'qwencoder.settings.v1';
-  static const _kAccounts = 'qwencoder.accounts.v1';
 
   static Future<AppSettings> loadSettings() async {
     final sp = await SharedPreferences.getInstance();
@@ -25,32 +26,9 @@ class StorageService {
     await sp.setString(_kSettings, jsonEncode(s.toJson()));
   }
 
-  static Future<List<QwenAccount>> loadAccounts() async {
-    final sp = await SharedPreferences.getInstance();
-    final raw = sp.getString(_kAccounts);
-    if (raw == null) return const [];
-    try {
-      final list = jsonDecode(raw) as List;
-      return list
-          .map((e) => QwenAccount.fromJson(e as Map<String, dynamic>))
-          .toList(growable: true);
-    } catch (_) {
-      return const [];
-    }
-  }
-
-  static Future<void> saveAccounts(List<QwenAccount> accounts) async {
-    final sp = await SharedPreferences.getInstance();
-    await sp.setString(
-      _kAccounts,
-      jsonEncode(accounts.map((a) => a.toJson()).toList()),
-    );
-  }
-
-  /// Limpa todas as credenciais — usado pelo botão "limpar tudo".
+  /// Limpa todas as configurações locais. Não afeta as contas no proxy.
   static Future<void> clearAll() async {
     final sp = await SharedPreferences.getInstance();
-    await sp.remove(_kAccounts);
     await sp.remove(_kSettings);
   }
 }

@@ -65,6 +65,13 @@ Thumbs.db
 *.keystore
 !debug.keystore
 
+# Proxy (Node) — dados runtime
+proxy/node_modules/
+proxy/data/
+proxy/dist/
+proxy/.env
+proxy/.env.local
+
 # Logs
 *.log
 flutter_*.png

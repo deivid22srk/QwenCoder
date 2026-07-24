@@ -1,183 +1,326 @@
 # QwenCoder
 
-> Cliente **Flutter** (Android + Web) para o proxy [**QwenBridge Custom Version**](https://github.com/deivid22srk/QwenBridge-Custom-Version) — layout inspirado no visual do Claude (`claude.ai`), com suporte completo a **tool calls**, **streaming SSE** e gerenciamento de **múltiplas contas Qwen**.
+> App **Flutter (Android)** + **Proxy QwenBridge modificado** — chat com a IA Qwen em tempo real, com **tool calls executadas no próprio proxy** e **gerenciamento de contas em runtime** via API.
 
-[![Build](https://github.com/deivid22srk/QwenCoder/actions/workflows/build.yml/badge.svg)](https://github.com/deivid22srk/QwenCoder/actions/workflows/build.yml)
+[![Build APK](https://github.com/deivid22srk/QwenCoder/actions/workflows/build.yml/badge.svg)](https://github.com/deivid22srk/QwenCoder/actions/workflows/build.yml)
 [![Flutter](https://img.shields.io/badge/Flutter-3.24-blue)](https://flutter.dev)
-[![Platform](https://img.shields.io/badge/Platform-Android%20%7C%20Web-purple)](#)
+[![Platform](https://img.shields.io/badge/Platform-Android-green)](#)
 
 ---
 
-## Visão geral
+## O que é
 
-O **QwenCoder** é o frontend móvel do seu proxy QwenBridge. Ele se conecta ao proxy rodando localmente (ou em qualquer host configurável) através da API compatível com OpenAI exposta pelo QwenBridge em `/v1/chat/completions`, `/v1/models`, etc.
+O **QwenCoder** é composto por duas partes que se comunicam:
 
 ```
-┌─────────────────┐         ┌────────────────────────┐         ┌────────────────┐
-│  QwenCoder App  │ ──HTTP──│ QwenBridge Proxy       │ ──HTTPS─│ chat.qwen.ai   │
-│  (Flutter)      │  SSE    │ (Node/Hono, localhost) │  Playwr │ (anti-bot)     │
-└─────────────────┘         └────────────────────────┘         └────────────────┘
+┌──────────────────────┐    HTTP + SSE    ┌──────────────────────────────────┐
+│  QwenCoder App       │ ◄─────────────► │  QwenBridge Proxy (modificado)   │
+│  (Flutter / Android) │                  │  (Node + Hono, neste repo em     │
+│                      │                  │   /proxy)                        │
+│  • UI estilo Claude  │                  │                                  │
+│  • streaming SSE     │                  │  • /v1/chat/completions (SSE     │
+│  • tool_call.start,  │                  │    com eventos extras)           │
+│    execute.*, result │                  │  • /v1/accounts (CRUD)           │
+│  • gerencia contas   │                  │  • /v1/accounts/stream (SSE)     │
+│    via /v1/accounts  │                  │  • /v1/tools                     │
+│                      │                  │  • executa tools server-side     │
+└──────────────────────┘                  │  • gerencia contas no SQLite     │
+                                          │  • rotaciona com cooldown        │
+                                          │  • stealth + Playwright          │
+                                          └──────────────────────────────────┘
+                                                                │
+                                                                ▼
+                                                        chat.qwen.ai
 ```
 
 ### Principais recursos
 
-- **Layout estilo Claude** — paleta dark (`#0b0b0b`, `#d97757`), fonte serif (Source Serif 4) para respostas da IA e sans (Inter) para mensagens do usuário.
-- **Conexão configurável** com o proxy — URL base editável (suporta `10.0.2.2:3000` no emulador, IP local no device físico, ou qualquer host remoto).
-- **Tool calling completo** — implementa 6 ferramentas locais que o modelo pode chamar (calculator, get_current_time, random_number, text_transform, device_info, get_weather). Suporta loop de tool calls encadeados (até 6 iterações).
-- **Streaming SSE** — tokens aparecem incrementalmente, igual à experiência do ChatGPT/Claude.
-- **Gerenciamento de contas Qwen** — adicionar, editar, ativar/desativar, excluir. Suporta importação em lote nos mesmos 4 formatos aceitos pelo QwenBridge.
-- **Geração do `QWEN_ACCOUNTS`** — botão que copia a string pronta para colar no `.env` do proxy.
-- **Android + Web** — o build.yml gera APK (debug + release) e o site Flutter Web (deploy automático no GitHub Pages).
+- **Tool calls executadas no proxy**, não no app. O proxy injeta as tools no request, detecta `tool_calls` no stream do modelo, executa server-side, e emite eventos SSE extras para o app mostrar **em tempo real**:
+  - `tool_call.start` — início de cada tool_call
+  - `tool_call.args_delta` — args JSON parciais (cada chunk)
+  - `tool_call.execute.start` — antes de executar
+  - `tool_call.execute.progress` — atualização de progresso
+  - `tool_call.execute.complete` — fim da execução
+  - `tool_call.result` — conteúdo completo do resultado
+  - `tool_call.loop` — próxima iteração do loop (até 6)
+
+- **Gerenciamento de contas em runtime** — o app lista/adiciona/remove contas Qwen via `POST /v1/accounts` no proxy. As senhas são armazenadas no SQLite do proxy (com encrypt Brotli), nunca no app. Mudanças refletem imediatamente no proxy.
+
+- **Streaming SSE em tempo real** — tokens aparecem incrementalmente na UI, e o card de cada tool call muda de estado visual conforme chegam os eventos: `preparando → executando → concluído` (ou `falhou`).
+
+- **Layout estilo Claude** — paleta dark (`#0b0b0b` / `#d97757`), fonte serif (Source Serif 4) para respostas, sans (Inter) para UI.
 
 ---
 
-## Pré-requisitos
+## Estrutura do repositório
 
-Para usar o app compilado, você precisa:
-
-1. **Do proxy QwenBridge rodando** em algum lugar alcançável pelo device.
-   - Emulador Android: `http://10.0.2.2:3000`
-   - Device físico na mesma rede: `http://192.168.x.y:3000`
-   - Servidor remoto: `https://seu-proxy.com`
-
-2. **Contas Qwen configuradas no proxy** (via `QWEN_ACCOUNTS` no `.env` ou `npm run login`).
-   - O QwenCoder também permite gerenciar essa lista e gerar a string `QWEN_ACCOUNTS` pronta para colar.
-
-3. **(Opcional) API key** se você configurou `API_KEY=...` no proxy.
+```
+QwenCoder/
+├── proxy/                       # ← QwenBridge modificado (Node + Hono)
+│   ├── src/
+│   │   ├── api/server.ts        # registra novas rotas
+│   │   ├── routes/
+│   │   │   ├── accounts/        # ← NOVO: /v1/accounts CRUD + SSE
+│   │   │   ├── tools/           # ← NOVO: registry + interceptor
+│   │   │   │   ├── registry.ts      # tools server-side + executor
+│   │   │   │   └── interceptor.ts   # wrap do /v1/chat/completions
+│   │   │   ├── chat/            # original (intacto)
+│   │   │   ├── anthropic/       # original (intacto)
+│   │   │   └── responses/       # original (intacto)
+│   │   ├── core/                # original (contas, config, db, etc)
+│   │   └── services/            # original (qwen, playwright, etc)
+│   ├── QWENCODER-PATCH.md       # documentação das extensões
+│   ├── README.md                # docs originais do QwenBridge
+│   ├── package.json
+│   ├── Dockerfile
+│   └── docker-compose.yml
+│
+├── lib/                         # ← App Flutter QwenCoder
+│   ├── main.dart
+│   ├── app.dart
+│   ├── models/
+│   │   ├── app_settings.dart
+│   │   ├── chat_message.dart
+│   │   ├── qwen_account.dart    # ← reflete o proxy (sem senha)
+│   │   ├── streaming_tool_call.dart
+│   │   └── tool_call.dart
+│   ├── services/
+│   │   ├── api_client.dart      # ← SSE rico + accounts API
+│   │   ├── chat_provider.dart   # ← orquestra eventos SSE
+│   │   └── storage_service.dart
+│   ├── screens/
+│   │   ├── chat_screen.dart
+│   │   └── settings_screen.dart # ← gerencia contas via proxy
+│   ├── theme/app_theme.dart
+│   └── widgets/
+│       ├── chat_input.dart
+│       ├── message_bubble.dart
+│       └── tool_call_card.dart  # ← streaming visual (start→executing→result)
+│
+├── android/                     # projeto Android
+├── assets/                      # ícones
+├── .github/workflows/build.yml  # CI: build APK + release em tags
+├── pubspec.yaml
+└── README.md
+```
 
 ---
 
-## Como compilar
+## Como rodar o proxy (QwenBridge modificado)
 
-### Via GitHub Actions (recomendado)
+### Pré-requisitos
 
-O workflow `.github/workflows/build.yml` é disparado em todo `push` para `main`/`master`, em qualquer `tag v*`, em PRs, ou manualmente via `workflow_dispatch`.
+- Node.js 20+
+- npm 9+
+- Playwright (para stealth + captura de headers anti-bot)
+
+### Passo a passo
+
+```bash
+# 1. Entrar na pasta do proxy
+cd proxy
+
+# 2. Instalar dependências
+npm install
+
+# 3. Instalar Chromium para o Playwright
+npx playwright install chromium
+
+# 4. Criar .env com suas contas Qwen (opcional — pode usar o app depois)
+cp .env.example .env
+# Edite o .env:
+#   QWEN_ACCOUNTS=user1@example.com:senha1;user2@example.com:senha2
+#   PORT=3000
+#   HOST=0.0.0.0
+#   API_KEY=                    # opcional, mas recomendado em produção
+
+# 5. (Alternativa ao .env) Login interativo — adiciona contas no SQLite
+npm run login
+#   [A] Adicionar uma conta
+#   [B] Adicionar várias contas em lote (4 formatos aceitos)
+#   [C] Criar contas automaticamente (mail.tm + captcha)
+#   [R] Remover conta
+#   [Q] Sair
+
+# 6. Iniciar o proxy
+npm start
+# Ouvindo em http://localhost:3000/v1
+```
+
+### Verificar se está funcionando
+
+```bash
+# Health check
+curl http://localhost:3000/health
+
+# Listar modelos
+curl http://localhost:3000/v1/models
+
+# Listar contas (sem senhas)
+curl http://localhost:3000/v1/accounts
+
+# Listar tools server-side disponíveis
+curl http://localhost:3000/v1/tools
+
+# Teste de chat simples (streaming)
+curl -N http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-coder-plus",
+    "messages": [{"role":"user","content":"Que horas são?"}],
+    "stream": true
+  }'
+# Você verá eventos SSE extras:
+#   event: tool_call.start
+#   event: tool_call.args_delta
+#   event: tool_call.execute.start
+#   event: tool_call.execute.progress
+#   event: tool_call.execute.complete
+#   event: tool_call.result
+#   event: tool_call.loop
+#   data: {"choices":[{"delta":{"content":"..."}}]}
+```
+
+### Adicionar contas em runtime via API (o que o app faz)
+
+```bash
+# Adicionar uma conta
+curl -X POST http://localhost:3000/v1/accounts \
+  -H "Content-Type: application/json" \
+  -d '{"email":"novo@x.com","password":"segredo"}'
+
+# Adicionar várias contas (3 formatos aceitos)
+curl -X POST http://localhost:3000/v1/accounts \
+  -H "Content-Type: application/json" \
+  -d '{"wire":"u1@x.com:p1;u2@x.com:p2;u3@x.com:p3"}'
+
+# Ou batch estruturado
+curl -X POST http://localhost:3000/v1/accounts \
+  -H "Content-Type: application/json" \
+  -d '{"accounts":[
+    {"email":"a@x.com","password":"p1"},
+    {"email":"b@x.com","password":"p2"}
+  ]}'
+
+# Remover uma conta
+curl -X DELETE http://localhost:3000/v1/accounts/<id>
+
+# Limpar cooldown de uma conta
+curl -X PATCH http://localhost:3000/v1/accounts/<id> \
+  -H "Content-Type: application/json" \
+  -d '{"action":"clear_cooldown"}'
+
+# Forçar warmup (re-init via Playwright em background)
+curl -X PATCH http://localhost:3000/v1/accounts/<id> \
+  -H "Content-Type: application/json" \
+  -d '{"action":"warmup"}'
+
+# SSE de mudanças de status em tempo real
+curl -N http://localhost:3000/v1/accounts/stream
+```
+
+### Docker
+
+```bash
+cd proxy
+docker-compose up -d
+# Veja docker-compose.yml para variáveis
+```
+
+---
+
+## Como rodar o app Flutter
+
+### Pré-requisitos
+
+- Flutter 3.24+
+- Android SDK (compileSdk 34)
+- Um emulador Android ou device físico
+
+### Passo a passo
+
+```bash
+# 1. Na raiz do repositório (fora de /proxy)
+flutter pub get
+
+# 2. Rodar em emulador/device
+flutter run
+
+# 3. Build APK release
+flutter build apk --release
+# APK gerado em build/app/outputs/flutter-apk/app-release.apk
+```
+
+### Configurando o app para conectar no proxy
+
+1. **No emulador Android**: use `http://10.0.2.2:3000` (o `10.0.2.2` mapeia para `localhost` do host)
+2. **No device físico** (mesma rede do proxy): use `http://<ip-do-pc>:3000` (ex: `http://192.168.0.10:3000`)
+3. **Servidor remoto**: use a URL pública
+
+Abra o app → ícone de engrenagem (canto superior direito) → configure:
+- **URL base do proxy**
+- **API key** (só se você configurou `API_KEY=` no `.env` do proxy)
+- Clique em **Testar conexão** — deve aparecer "Proxy online — N modelos, M contas, K tools"
+
+---
+
+## Build via GitHub Actions (CI)
+
+O workflow `.github/workflows/build.yml` roda em todo push para `main`/`master`, em tags `v*`, em PRs, ou manualmente.
 
 Ele:
-1. Faz setup do Flutter 3.24 + Java 17
-2. Roda `flutter pub get`, `flutter analyze`, e `dart run flutter_launcher_icons`
-3. Compila `flutter build apk --debug` e `flutter build apk --release`
-4. Sobe ambos como artifacts do workflow (retention 30/7 dias)
-5. Em pushes para `main` ou tags `v*`, compila também o **site Flutter Web** e publica em GitHub Pages
-6. Em tags `v*`, cria um **GitHub Release** automático com o APK anexado
+1. Setup Flutter 3.24 + Java 17
+2. `flutter pub get`, `flutter analyze`, `flutter_launcher_icons`
+3. `flutter build apk --debug` + `flutter build apk --release`
+4. Sobe ambos como artifacts (retenção 30/7 dias)
+5. Em tags `v*`: cria um **GitHub Release** automático com o APK anexado
 
-### Local
+Para baixar o APK depois de um build:
+1. Acesse https://github.com/deivid22srk/QwenCoder/actions
+2. Clique no último run verde
+3. Baixe o artifact `qwencoder-apk-release`
 
+Para criar uma release com APK:
 ```bash
-# Pré-requisitos: Flutter 3.24+ e Android SDK
-flutter pub get
-dart run flutter_launcher_icons
-flutter run                       # debug no device/emulador
-flutter build apk --release       # APK release em build/app/outputs/flutter-apk/
-flutter build web --release       # Site em build/web/
+git tag v1.0.0
+git push origin v1.0.0
 ```
 
 ---
 
-## Arquitetura do app
+## Tools server-side disponíveis (no proxy)
 
-```
-lib/
-├── main.dart                 # entrypoint — inicializa o provider
-├── app.dart                  # MaterialApp com tema dark
-├── models/
-│   ├── app_settings.dart     # settings persistidas (URL, API key, modelo, etc)
-│   ├── chat_message.dart     # ChatMessage (user/assistant/tool/system)
-│   ├── qwen_account.dart     # conta Qwen (email, senha, label, enabled)
-│   └── tool_call.dart        # ToolCall + parser JSON tolerante
-├── services/
-│   ├── api_client.dart       # cliente OpenAI-compat com streaming SSE
-│   ├── chat_provider.dart    # ChangeNotifier — orquestra chat + tool call loop
-│   ├── storage_service.dart  # persistência (SharedPreferences)
-│   └── tool_executor.dart    # executor de ferramentas locais + schemas OpenAI
-├── screens/
-│   ├── chat_screen.dart      # tela principal de chat
-│   └── settings_screen.dart  # configurações + contas Qwen
-├── theme/
-│   └── app_theme.dart        # tema dark estilo Claude + fontes Google
-└── widgets/
-    ├── chat_input.dart       # caixa de texto arredondada
-    ├── message_bubble.dart   # bolhas user/assistant/tool estilo Claude
-    └── tool_call_card.dart   # card expansível para tool calls
-```
+| Tool | Descrição |
+|---|---|
+| `get_current_time` | Data/hora atual do servidor proxy |
+| `calculator` | Avaliador matemático seguro (sem eval) |
+| `random_number` | Inteiro aleatório em [min, max] |
+| `list_qwen_accounts` | Lista contas do proxy (sem expor senhas) |
+| `http_request` | HTTP request a URL pública (o proxy executa) |
 
-### Tool calling loop
+Para adicionar mais tools, edite `proxy/src/routes/tools/registry.ts`:
+1. Crie um `ToolDefinition` com `name`, `description`, `parameters`, `execute`
+2. Adicione ao array `REGISTRY`
 
-O `ChatProvider._runCompletionLoop` implementa o loop padrão de tool calling OpenAI:
-
-1. Envia mensagens + tools pro proxy via `POST /v1/chat/completions` (streaming SSE)
-2. Acumula `delta.content` e `delta.tool_calls` do stream
-3. Se o modelo retornou `tool_calls`, executa cada ferramenta via `ToolExecutor.execute` localmente
-4. Adiciona uma mensagem `role: tool` para cada resultado
-5. Refaz a requisição com o histórico atualizado (até 6 iterações)
-6. Quando o modelo não pede mais tools, a resposta final é exibida
-
-### Ferramentas locais disponíveis
-
-| Tool              | Descrição                                                            |
-|-------------------|----------------------------------------------------------------------|
-| `get_current_time`| Data/hora atual no device (ISO-8601 + formato amigável PT-BR)        |
-| `calculator`      | Avaliador matemático seguro (4 ops, ^, sqrt, sin, cos, tan, log, ln)|
-| `random_number`   | Inteiro aleatório em [min, max]                                      |
-| `text_transform`  | uppercase/lowercase/titlecase/reverse/base64/length/word_count       |
-| `device_info`     | Plataforma (android/ios/web/...), locale                             |
-| `get_weather`     | Mock de clima (determinístico por cidade — substitua por API real)   |
-
-Para adicionar novas ferramentas, edite `lib/services/tool_executor.dart`:
-1. Adicione uma nova entrada em `allDefinitions()` (schema OpenAI)
-2. Adicione um `case` no `execute()` que retorna um `ToolResult`
+O `execute(args, ctx)` recebe `(args, ctx)` onde `ctx.emitProgress({message, percent?})`
+envia um evento SSE de progresso em tempo real para o cliente.
 
 ---
 
-## Como usar o app
+## Arquitetura do streaming SSE
 
-1. **Abra o QwenCoder** no device
-2. Vá em **Configurações** (ícone de engrenagem no topo direito)
-3. Em **Conexão com o Proxy QwenBridge**, configure:
-   - **URL base**: `http://10.0.2.2:3000` (emulador) ou `http://<seu-ip>:3000` (device físico)
-   - **API key**: só preencha se o proxy tiver `API_KEY=...` configurado
-4. Clique em **Testar conexão** — deve aparecer "Proxy online — N modelos disponíveis."
-5. Em **Contas Qwen**, adicione suas contas (individualmente ou em lote — mesmos 4 formatos do QwenBridge)
-6. Use **Copiar QWEN_ACCOUNTS para .env do proxy** para gerar a string e colar no `.env` do QwenBridge
-7. Volte para a tela de chat, escolha o modelo (ícone de chip no topo), e comece a conversar
-8. Teste tool calls perguntando, por exemplo:
-   - *"Que horas são agora no meu device?"*
-   - *"Calcule 2*(3+4)^2 - sqrt(16)"*
-   - *"Converta 'QwenCoder' para base64"*
+Quando o usuário envia uma mensagem no app:
 
----
-
-## Configuração de rede no Android
-
-O `AndroidManifest.xml` já vem com:
-- `INTERNET` e `ACCESS_NETWORK_STATE` permissions
-- `usesCleartextTraffic="true"` (necessário para HTTP em localhost)
-- `network_security_config.xml` permitindo cleartext para `localhost`, `10.0.2.2` e `127.0.0.1`
-
-Se você for usar HTTPS com certificado auto-assinado, precisará adicionar o certificado ao `network_security_config.xml`.
-
----
-
-## Deploy Web (GitHub Pages)
-
-O workflow publica automaticamente em `https://deivid22srk.github.io/QwenCoder/` após cada push em `main`.
-
-Para rodar localmente:
-```bash
-flutter build web --release
-cd build/web && python3 -m http.server 8080
-# abre http://localhost:8080
-```
-
-⚠️ **Atenção CORS no Web**: o proxy QwenBridge precisa permitir CORS para a origem do site. Adicione `Access-Control-Allow-Origin: *` (ou o domínio específico do GitHub Pages) no proxy, senão o navegador bloqueia as requisições.
-
----
-
-## Tokens e Segurança
-
-- As **credenciais das contas Qwen** ficam salvas apenas no sandbox do app (SharedPreferences). Não são enviadas para nenhum servidor além do proxy configurado.
-- A **URL do proxy** e a **API key** também ficam no sandbox.
-- **Não** deixe seu repositório público com `.env` ou credenciais commitadas.
+1. **App → Proxy**: `POST /v1/chat/completions` com `stream: true` e `enable_tools: true`
+2. **Proxy → Qwen**: injeta tools server-side e repassa ao modelo
+3. **Qwen → Proxy**: stream SSE com `delta.content` (texto) e `delta.tool_calls` (se houver)
+4. **Proxy → App**: repassa texto + emite eventos extras (`tool_call.start`, `args_delta`)
+5. **Proxy executa tool**: chama `ToolDefinition.execute(args, ctx)` server-side
+   - Durante execução: emite `tool_call.execute.progress`
+   - Ao final: emite `tool_call.execute.complete` + `tool_call.result`
+6. **Proxy → Qwen**: re-envia conversa com `tool_result` incluído
+7. **Loop**: até 6 iterações (evento `tool_call.loop` em cada)
+8. **App mostra tudo em tempo real**: cada evento atualiza o `ToolCallCard` na UI
 
 ---
 
@@ -185,35 +328,28 @@ cd build/web && python3 -m http.server 8080
 
 | Problema | Solução |
 |---|---|
-| `Proxy offline` em vermelho | Verifique se o QwenBridge está rodando e acessível pela URL configurada. No emulador use `10.0.2.2`, não `localhost`. |
-| `Connection refused` | O proxy não está escutando na porta configurada, ou firewall bloqueando. |
-| Nenhum modelo carregado | Proxy online mas `/v1/models` vazio — provavelmente você não configurou contas Qwen (`QWEN_ACCOUNTS`). |
-| Tool calls não funcionam | Verifique se "Habilitar tool calls" está ligado nas configurações. Confirme que o modelo escolhido suporta function calling (todos os qwen3-coder-plus, qwen3.x-plus suportam). |
-| Stream trava | Aumente o timeout no proxy (`TOTAL_REQUEST_TIMEOUT`). |
+| `Proxy offline` no app | Verifique se `npm start` está rodando. No emulador use `10.0.2.2`, não `localhost`. |
+| Nenhum modelo carregado | Configure `QWEN_ACCOUNTS` no `.env` ou use o app em Configurações → Contas Qwen. |
+| Tool calls não aparecem | Verifique se "Habilitar tool calls" está ligado nas configurações. |
+| `Connection refused` | Firewall bloqueando ou porta errada. |
 | APK não instala | Habilite "Fontes desconhecidas" no Android. |
-| Web não conecta no proxy | Verifique CORS no proxy e se a URL é HTTPS (browsers bloqueiam mixed content). |
+| Playwright não inicia | Rode `npx playwright install chromium` em `proxy/`. |
+| Conta em cooldown | Botão "Limpar cooldown" no app, ou aguarde o tempo expirar. |
 
 ---
 
-## Roadmap
+## Documentação adicional
 
-- [ ] Anexos multimodais (imagens, PDFs) via `/v1/upload` do QwenBridge
-- [ ] Histórico de conversas persistido (SQLite)
-- [ ] Múltiplas sessões em paralelo (sidebar com lista)
-- [ ] Suporte ao endpoint `/v1/messages` (Anthropic format)
-- [ ] Renderização LaTeX (via `flutter_math_fork`)
-- [ ] Modo claro (light theme)
-- [ ] Backup/restore de configurações
-- [ ] FAB para anexos
-
----
+- **`proxy/QWENCODER-PATCH.md`** — detalhes das extensões adicionadas ao QwenBridge
+- **`proxy/README.md`** — documentação original do QwenBridge (upstream)
+- **`proxy/docs/rotas-compatibilidade-confirmada.md`** — rotas OpenAI/Anthropic suportadas
 
 ## Licença
 
-ISC — mesmo licença do upstream QwenBridge.
+ISC — mesmo licença do QwenBridge upstream.
 
 ## Créditos
 
 - **Proxy backend**: [QwenBridge Custom Version](https://github.com/deivid22srk/QwenBridge-Custom-Version) por [@deivid22srk](https://github.com/deivid22srk)
 - **Design inspiration**: Claude interface (`claude.ai`)
-- **Fontes**: Inter (Rasmus Andersson) e Source Serif 4 (Google Fonts)
+- **Fontes**: Inter (Rasmus Andersson), Source Serif 4 (Google Fonts)

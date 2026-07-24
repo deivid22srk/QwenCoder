@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+
+# Build
+dist/
+
+# Environment
+.env
+.env.local
+.env.production
+
+# Persistent runtime data (DB, profiles, benchmarks, diagnostics)
+data/
+*.db
+*.db-wal
+*.db-shm
+accounts.json
+accounts.json.bak
+
+# Logs
+*.log
+log*.txt
+
+# Local network captures may contain cookies/tokens
+network/
+
+# Coverage & cache
+coverage/
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE / Editor
+.kilo
+.roo
+
+# Captcha solver debug artifacts
+tools/aliyun-captcha-solver/artifacts/
+

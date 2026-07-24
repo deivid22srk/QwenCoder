@@ -1,0 +1,14 @@
+{
+  "name": "embedded-aliyun-captcha-solver",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "api": "node server.js"
+  },
+  "dependencies": {
+    "chrome-remote-interface": "^0.33.2",
+    "qwenbridge": "file:../..",
+    "sharp": "^0.33.5"
+  }
+}

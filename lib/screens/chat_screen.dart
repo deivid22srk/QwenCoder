@@ -64,7 +64,7 @@ class _ChatScreenState extends State<ChatScreen> {
             const Text('QwenCoder'),
             Text(
               provider.proxyOnline
-                  ? '${provider.settings.defaultModel}  •  ${provider.accounts.length} conta(s)'
+                  ? '${provider.settings.defaultModel}  •  ${provider.accounts.length} conta(s)  •  ${provider.serverTools.length} tool(s)'
                   : (provider.connectionError ?? 'Proxy offline'),
               style: AppTheme.sansTextStyle(color: provider.proxyOnline ? AppTheme.textMuted : AppTheme.statusError,
                 fontSize: 11,
@@ -252,10 +252,10 @@ class _EmptyState extends StatelessWidget {
   const _EmptyState({required this.onPickSuggestion});
 
   static const _suggestions = [
-    'Que horas são agora no meu device?',
+    'Que horas são agora no servidor?',
     'Calcule 2*(3+4)^2 - sqrt(16)',
-    'Converta "QwenCoder" para base64',
-    'Como funciona o tool call em LLMs?',
+    'Quantas contas Qwen estão ativas no proxy?',
+    'Faça um GET para https://api.github.com/repos/deivid22srk/QwenCoder',
   ];
 
   @override

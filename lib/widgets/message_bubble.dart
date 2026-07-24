@@ -1,14 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
-import 'package:google_fonts/google_fonts.dart';
 import '../models/chat_message.dart';
 import '../theme/app_theme.dart';
 import 'tool_call_card.dart';
 
-/// Bolha de mensagem individual, com aparência inspirada no Claude:
-/// - Mensagens do usuário: fundo bg-bg-300, canto direito arredondado, fonte sans
-/// - Respostas do assistant: sem fundo (inline), fonte serif, padding generoso
-/// - Tool messages: card compacto mostrando o resultado da ferramenta
+/// Bolha de mensagem individual, com aparência inspirada no Claude.
 class MessageBubble extends StatelessWidget {
   final ChatMessage message;
   final bool isLast;
@@ -23,7 +19,7 @@ class MessageBubble extends StatelessWidget {
       case MessageRole.assistant:
         return _buildAssistant(context);
       case MessageRole.tool:
-        return _buildTool(context);
+        return const SizedBox.shrink(); // tool calls são exibidos inline no assistant
       case MessageRole.system:
         return const SizedBox.shrink();
     }
@@ -63,8 +59,9 @@ class MessageBubble extends StatelessWidget {
   Widget _buildAssistant(BuildContext context) {
     final isStreaming = message.status == MessageStatus.streaming;
     final isError = message.status == MessageStatus.error;
+    final isToolRunning = message.status == MessageStatus.toolRunning;
     final hasContent = message.content.isNotEmpty;
-    final hasToolCalls = message.toolCalls.isNotEmpty;
+    final hasToolCalls = message.streamingToolCalls.isNotEmpty;
 
     return Container(
       margin: const EdgeInsets.symmetric(vertical: 6, horizontal: 12),
@@ -95,7 +92,7 @@ class MessageBubble extends StatelessWidget {
                 ),
               ),
               const Spacer(),
-              if (isStreaming)
+              if (isStreaming || isToolRunning)
                 Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
@@ -109,7 +106,7 @@ class MessageBubble extends StatelessWidget {
                     ),
                     const SizedBox(width: 6),
                     Text(
-                      'gerando…',
+                      isToolRunning ? 'executando tool…' : 'gerando…',
                       style: AppTheme.sansTextStyle(
                         color: AppTheme.textMuted,
                         fontSize: 11,
@@ -117,77 +114,92 @@ class MessageBubble extends StatelessWidget {
                     ),
                   ],
                 ),
+              if (message.metadata['loop_iteration'] != null) ...[
+                const SizedBox(width: 8),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: AppTheme.bgSurfaceAlt,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    'loop #${message.metadata['loop_iteration']}',
+                    style: AppTheme.sansTextStyle(
+                      color: AppTheme.claudeOrange,
+                      fontSize: 10,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ],
             ],
           ),
           const SizedBox(height: 8),
-          // Tool calls (se houver)
+          // Tool calls em streaming (cada um com card próprio)
           if (hasToolCalls) ...[
-            for (final tc in message.toolCalls) ToolCallCard(toolCall: tc),
+            for (final tc in message.streamingToolCalls) ToolCallCard(toolCall: tc),
             const SizedBox(height: 8),
           ],
           // Conteúdo textual (serif, estilo Claude)
           if (hasContent)
-            Padding(
-              padding: const EdgeInsets.only(left: 0),
-              child: MarkdownBody(
-                data: message.content,
-                selectable: true,
-                styleSheet: MarkdownStyleSheet(
-                  p: AppTheme.serifTextStyle(
-                    color: AppTheme.textPrimary,
-                    fontSize: 16,
-                    height: 1.65,
+            MarkdownBody(
+              data: message.content,
+              selectable: true,
+              styleSheet: MarkdownStyleSheet(
+                p: AppTheme.serifTextStyle(
+                  color: AppTheme.textPrimary,
+                  fontSize: 16,
+                  height: 1.65,
+                ),
+                h1: AppTheme.sansTextStyle(
+                  color: AppTheme.textPrimary,
+                  fontSize: 22,
+                  fontWeight: FontWeight.w700,
+                ),
+                h2: AppTheme.sansTextStyle(
+                  color: AppTheme.textPrimary,
+                  fontSize: 19,
+                  fontWeight: FontWeight.w700,
+                ),
+                h3: AppTheme.sansTextStyle(
+                  color: AppTheme.textPrimary,
+                  fontSize: 17,
+                  fontWeight: FontWeight.w600,
+                ),
+                code: TextStyle(
+                  fontFamily: 'monospace',
+                  color: AppTheme.claudeOrangeLight,
+                  backgroundColor: AppTheme.bgSurface,
+                  fontSize: 14,
+                ),
+                codeblockDecoration: BoxDecoration(
+                  color: AppTheme.bgSurface,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: AppTheme.borderSubtle, width: 0.5),
+                ),
+                blockquoteDecoration: BoxDecoration(
+                  border: Border(
+                    left: BorderSide(color: AppTheme.claudeOrange, width: 2),
                   ),
-                  h1: AppTheme.sansTextStyle(
-                    color: AppTheme.textPrimary,
-                    fontSize: 22,
-                    fontWeight: FontWeight.w700,
-                  ),
-                  h2: AppTheme.sansTextStyle(
-                    color: AppTheme.textPrimary,
-                    fontSize: 19,
-                    fontWeight: FontWeight.w700,
-                  ),
-                  h3: AppTheme.sansTextStyle(
-                    color: AppTheme.textPrimary,
-                    fontSize: 17,
-                    fontWeight: FontWeight.w600,
-                  ),
-                  code: TextStyle(
-                    fontFamily: 'monospace',
-                    color: AppTheme.claudeOrangeLight,
-                    backgroundColor: AppTheme.bgSurface,
-                    fontSize: 14,
-                  ),
-                  codeblockDecoration: BoxDecoration(
-                    color: AppTheme.bgSurface,
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: AppTheme.borderSubtle, width: 0.5),
-                  ),
-                  blockquoteDecoration: BoxDecoration(
-                    border: Border(
-                      left: BorderSide(color: AppTheme.claudeOrange, width: 2),
-                    ),
-                  ),
-                  listBullet: AppTheme.sansTextStyle(color: AppTheme.claudeOrange),
-                  strong: AppTheme.serifTextStyle(
-                    fontWeight: FontWeight.w700,
-                    color: AppTheme.textPrimary,
-                  ),
-                  em: AppTheme.serifTextStyle(
-                    fontWeight: FontWeight.w400,
-                    color: AppTheme.textPrimary,
-                  ).copyWith(fontStyle: FontStyle.italic),
-                  a: TextStyle(
-                    color: AppTheme.claudeOrange,
-                    decoration: TextDecoration.underline,
-                  ),
+                ),
+                listBullet: AppTheme.sansTextStyle(color: AppTheme.claudeOrange),
+                strong: AppTheme.serifTextStyle(
+                  fontWeight: FontWeight.w700,
+                  color: AppTheme.textPrimary,
+                ),
+                em: AppTheme.serifTextStyle(
+                  fontWeight: FontWeight.w400,
+                  color: AppTheme.textPrimary,
+                ).copyWith(fontStyle: FontStyle.italic),
+                a: TextStyle(
+                  color: AppTheme.claudeOrange,
+                  decoration: TextDecoration.underline,
                 ),
               ),
             ),
-          if (isStreaming && !hasContent)
-            Padding(
-              padding: const EdgeInsets.only(top: 4, bottom: 4),
+          if (isStreaming && !hasContent && !hasToolCalls)
+            const Padding(
+              padding: EdgeInsets.only(top: 4, bottom: 4),
               child: _BlinkingDots(),
             ),
           if (isError && message.error != null)
@@ -210,51 +222,6 @@ class MessageBubble extends StatelessWidget {
                 ],
               ),
             ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildTool(BuildContext context) {
-    return Container(
-      margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 36),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: AppTheme.bgSurface,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: AppTheme.borderSubtle, width: 0.4),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Icon(Icons.build_circle, size: 16, color: AppTheme.claudeOrange),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'tool · ${message.toolName ?? 'unknown'}',
-                  style: AppTheme.sansTextStyle(
-                    color: AppTheme.claudeOrange,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                const SizedBox(height: 2),
-                SelectableText(
-                  message.content,
-                  style: TextStyle(
-                    fontFamily: 'monospace',
-                    color: AppTheme.textSecondary,
-                    fontSize: 12,
-                    height: 1.4,
-                  ),
-                  maxLines: 8,
-                ),
-              ],
-            ),
-          ),
         ],
       ),
     );

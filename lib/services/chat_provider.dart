@@ -2,17 +2,16 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import '../models/app_settings.dart';
 import '../models/chat_message.dart';
-import '../models/tool_call.dart';
 import '../models/qwen_account.dart';
+import '../models/streaming_tool_call.dart';
 import 'api_client.dart';
 import 'storage_service.dart';
-import 'tool_executor.dart';
 
 /// Provider central que gerencia:
 /// - settings (URL do proxy, API key, modelo, etc.)
-/// - contas Qwen (lista persistida)
+/// - contas Qwen (vindas do proxy em tempo real)
 /// - histórico de mensagens da sessão atual
-/// - dispatch de mensagens com tool call loop
+/// - dispatch de mensagens com streaming SSE rico (tool_call.start, execute.*, result)
 class ChatProvider extends ChangeNotifier {
   ChatProvider() {
     _init();
@@ -23,30 +22,30 @@ class ChatProvider extends ChangeNotifier {
   List<QwenAccount> _accounts = const [];
   List<ChatMessage> _messages = const [];
   List<String> _models = const [];
+  List<Map<String, dynamic>> _serverTools = const [];
   bool _isSending = false;
   bool _isConnecting = false;
   String? _connectionError;
   bool _proxyOnline = false;
+  StreamSubscription<AccountsSnapshot>? _accountsStreamSub;
 
   // --- Getters ---
   AppSettings get settings => _settings;
   List<QwenAccount> get accounts => List.unmodifiable(_accounts);
   List<ChatMessage> get messages => List.unmodifiable(_messages);
   List<String> get models => List.unmodifiable(_models);
+  List<Map<String, dynamic>> get serverTools => List.unmodifiable(_serverTools);
   bool get isSending => _isSending;
   bool get isConnecting => _isConnecting;
   String? get connectionError => _connectionError;
   bool get proxyOnline => _proxyOnline;
   ApiClient? _client;
-
   ApiClient? get client => _client;
 
   Future<void> _init() async {
     _settings = await StorageService.loadSettings();
-    _accounts = await StorageService.loadAccounts();
     _rebuildClient();
     notifyListeners();
-    // Verifica conexão em background
     unawaited(_refreshProxyStatus());
   }
 
@@ -67,6 +66,9 @@ class ChatProvider extends ChangeNotifier {
       _proxyOnline = ok;
       if (ok) {
         await _refreshModels();
+        await _refreshTools();
+        await _refreshAccounts();
+        _startAccountsStream();
       } else {
         _connectionError = 'Proxy offline em ${_settings.proxyBaseUrl}';
       }
@@ -89,6 +91,40 @@ class ChatProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> _refreshTools() async {
+    try {
+      _serverTools = await _client!.listServerTools().timeout(const Duration(seconds: 10));
+    } catch (_) {
+      _serverTools = const [];
+    }
+    notifyListeners();
+  }
+
+  Future<void> _refreshAccounts() async {
+    try {
+      final snap = await _client!.listAccounts().timeout(const Duration(seconds: 10));
+      _accounts = snap.accounts;
+    } catch (_) {
+      _accounts = const [];
+    }
+    notifyListeners();
+  }
+
+  void _startAccountsStream() {
+    _accountsStreamSub?.cancel();
+    if (_client == null) return;
+    _accountsStreamSub = _client!.streamAccounts().listen(
+      (snap) {
+        _accounts = snap.accounts;
+        notifyListeners();
+      },
+      onError: (e) {
+        // Silencioso — próxima chamada HTTP vai reabrir stream
+        debugPrint('accounts stream error: $e');
+      },
+    );
+  }
+
   // --- Settings ---
 
   Future<void> updateSettings(AppSettings next) async {
@@ -100,6 +136,9 @@ class ChatProvider extends ChangeNotifier {
       _rebuildClient();
       _proxyOnline = false;
       _models = const [];
+      _accounts = const [];
+      _serverTools = const [];
+      _accountsStreamSub?.cancel();
       notifyListeners();
       await _refreshProxyStatus();
     } else {
@@ -111,33 +150,42 @@ class ChatProvider extends ChangeNotifier {
     await _refreshProxyStatus();
   }
 
-  // --- Accounts ---
+  // --- Accounts management (delegados ao proxy) ---
 
-  Future<void> addAccount(QwenAccount acc) async {
-    _accounts = [..._accounts, acc];
-    await StorageService.saveAccounts(_accounts);
-    notifyListeners();
+  Future<AddAccountsResult> addAccount({required String email, required String password}) async {
+    final r = await _client!.addAccount(email: email, password: password);
+    await _refreshAccounts();
+    return r;
   }
 
-  Future<void> updateAccount(QwenAccount acc) async {
-    _accounts = _accounts.map((a) => a.id == acc.id ? acc : a).toList();
-    await StorageService.saveAccounts(_accounts);
-    notifyListeners();
+  Future<AddAccountsResult> addAccountsBatch(List<({String email, String password})> accounts) async {
+    final r = await _client!.addAccountsBatch(accounts);
+    await _refreshAccounts();
+    return r;
   }
 
-  Future<void> removeAccount(String id) async {
-    _accounts = _accounts.where((a) => a.id != id).toList();
-    await StorageService.saveAccounts(_accounts);
-    notifyListeners();
+  Future<AddAccountsResult> addAccountsFromWire(String wire) async {
+    final r = await _client!.addAccountsFromWire(wire);
+    await _refreshAccounts();
+    return r;
   }
 
-  /// Constrói a string `QWEN_ACCOUNTS=user:pass;user:pass` com todas as contas habilitadas.
-  /// Útil para o usuário copiar/colar no `.env` do proxy QwenBridge.
-  String buildWireString() {
-    return _accounts
-        .where((a) => a.enabled)
-        .map((a) => a.toWireFormat())
-        .join(';');
+  Future<bool> removeAccount(String id) async {
+    final ok = await _client!.removeAccount(id);
+    if (ok) await _refreshAccounts();
+    return ok;
+  }
+
+  Future<bool> clearAccountCooldown(String id) async {
+    final ok = await _client!.patchAccount(id, action: 'clear_cooldown');
+    if (ok) await _refreshAccounts();
+    return ok;
+  }
+
+  Future<bool> warmupAccount(String id) async {
+    final ok = await _client!.patchAccount(id, action: 'warmup');
+    if (ok) await _refreshAccounts();
+    return ok;
   }
 
   // --- Chat ---
@@ -147,7 +195,8 @@ class ChatProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Envia uma mensagem de usuário e processa a resposta (com tool calls).
+  /// Envia uma mensagem de usuário e processa o stream SSE rico do proxy.
+  /// O proxy executa tools server-side — só recebemos eventos para exibir.
   Future<void> sendUserMessage(String text) async {
     if (text.trim().isEmpty || _isSending) return;
     if (_client == null) {
@@ -169,108 +218,170 @@ class ChatProvider extends ChangeNotifier {
     }
     history.addAll(_messages.where((m) => m.id != assistantMsg.id));
 
-    await _runCompletionLoop(history, assistantMsg);
+    final stream = _client!.chatStream(
+      model: _settings.defaultModel,
+      messages: history,
+      temperature: _settings.temperature,
+    );
+
+    // Mapa de tool_call_id -> StreamingToolCall (estado corrente)
+    final streamingTools = <String, StreamingToolCall>{};
+
+    await for (final ev in stream) {
+      switch (ev) {
+        case ChatDeltaEvent(:final text):
+          assistantMsg = assistantMsg.copyWith(
+            content: assistantMsg.content + text,
+            status: MessageStatus.streaming,
+          );
+          _updateMessage(assistantMsg);
+          break;
+
+        case ToolCallStartEvent(:final toolCallId, :final name, :final iteration):
+          final tc = StreamingToolCall(
+            id: toolCallId,
+            name: name,
+            status: ToolCallStatus.receivingArgs,
+          );
+          streamingTools[toolCallId] = tc;
+          assistantMsg = assistantMsg.copyWith(
+            streamingToolCalls: [...streamingTools.values],
+            status: MessageStatus.toolRunning,
+          );
+          _updateMessage(assistantMsg);
+          break;
+
+        case ToolCallArgsDeltaEvent(:final toolCallId, :final delta):
+          final existing = streamingTools[toolCallId];
+          if (existing != null) {
+            streamingTools[toolCallId] = existing.copyWith(
+              argsBuffer: existing.argsBuffer + delta,
+            );
+            assistantMsg = assistantMsg.copyWith(
+              streamingToolCalls: [...streamingTools.values],
+            );
+            _updateMessage(assistantMsg);
+          }
+          break;
+
+        case ToolCallExecuteStartEvent(:final toolCallId, :final startedAt):
+          final existing = streamingTools[toolCallId];
+          if (existing != null) {
+            streamingTools[toolCallId] = existing.copyWith(
+              status: ToolCallStatus.executing,
+              startedAt: startedAt,
+            );
+            assistantMsg = assistantMsg.copyWith(
+              streamingToolCalls: [...streamingTools.values],
+            );
+            _updateMessage(assistantMsg);
+          }
+          break;
+
+        case ToolCallProgressEvent(:final toolCallId, :final message, :final percent):
+          final existing = streamingTools[toolCallId];
+          if (existing != null) {
+            streamingTools[toolCallId] = existing.copyWith(
+              progressUpdates: [
+                ...existing.progressUpdates,
+                ToolCallProgressUpdate(
+                  message: message,
+                  percent: percent,
+                  timestamp: DateTime.now(),
+                ),
+              ],
+            );
+            assistantMsg = assistantMsg.copyWith(
+              streamingToolCalls: [...streamingTools.values],
+            );
+            _updateMessage(assistantMsg);
+          }
+          break;
+
+        case ToolCallExecuteCompleteEvent(:final toolCallId, :final success, :final durationMs):
+          final existing = streamingTools[toolCallId];
+          if (existing != null) {
+            streamingTools[toolCallId] = existing.copyWith(
+              status: success ? ToolCallStatus.completed : ToolCallStatus.failed,
+              durationMs: durationMs,
+              completedAt: DateTime.now(),
+            );
+            assistantMsg = assistantMsg.copyWith(
+              streamingToolCalls: [...streamingTools.values],
+            );
+            _updateMessage(assistantMsg);
+          }
+          break;
+
+        case ToolCallResultEvent(:final toolCallId, :final content, :final isError, :final durationMs, :final name):
+          final existing = streamingTools[toolCallId];
+          if (existing != null) {
+            streamingTools[toolCallId] = existing.copyWith(
+              resultContent: content,
+              isError: isError,
+              durationMs: durationMs,
+              status: isError ? ToolCallStatus.failed : ToolCallStatus.completed,
+            );
+            assistantMsg = assistantMsg.copyWith(
+              streamingToolCalls: [...streamingTools.values],
+            );
+            _updateMessage(assistantMsg);
+          } else {
+            // Resultado sem start anterior — cria agora
+            streamingTools[toolCallId] = StreamingToolCall(
+              id: toolCallId,
+              name: name,
+              resultContent: content,
+              isError: isError,
+              durationMs: durationMs,
+              status: isError ? ToolCallStatus.failed : ToolCallStatus.completed,
+              completedAt: DateTime.now(),
+            );
+            assistantMsg = assistantMsg.copyWith(
+              streamingToolCalls: [...streamingTools.values],
+            );
+            _updateMessage(assistantMsg);
+          }
+          break;
+
+        case ToolCallLoopEvent(:final iteration):
+          // Próxima iteração do loop server-side — limpa tools atuais para a próxima rodada
+          // mas mantém o histórico visível
+          assistantMsg = assistantMsg.copyWith(
+            metadata: {...assistantMsg.metadata, 'loop_iteration': iteration},
+          );
+          _updateMessage(assistantMsg);
+          break;
+
+        case ChatToolCallsEvent():
+          // Tool calls finais no formato OpenAI padrão (caso o proxy não emita eventos extras)
+          // — já coberto pelos eventos acima, ignoramos aqui
+          break;
+
+        case ChatErrorEvent(:final message):
+          assistantMsg = assistantMsg.copyWith(
+            content: assistantMsg.content.isEmpty
+                ? '❌ Erro: $message'
+                : '${assistantMsg.content}\n\n❌ Erro: $message',
+            status: MessageStatus.error,
+            error: message,
+          );
+          _updateMessage(assistantMsg);
+          _isSending = false;
+          notifyListeners();
+          return;
+
+        case ChatDoneEvent():
+          assistantMsg = assistantMsg.copyWith(
+            status: MessageStatus.complete,
+          );
+          _updateMessage(assistantMsg);
+          break;
+      }
+    }
 
     _isSending = false;
     notifyListeners();
-  }
-
-  Future<void> _runCompletionLoop(List<ChatMessage> history, ChatMessage assistantMsg) async {
-    const maxIterations = 6; // Limite de tool calls encadeados
-    var currentHistory = List<ChatMessage>.from(history);
-    var currentAssistant = assistantMsg;
-
-    for (var i = 0; i < maxIterations; i++) {
-      var content = '';
-      List<ToolCall> toolCalls = const [];
-      var hadError = false;
-      String? errorMsg;
-
-      final completer = Completer<void>();
-      final stream = _client!.chatStream(
-        model: _settings.defaultModel,
-        messages: currentHistory,
-        temperature: _settings.temperature,
-        enableTools: _settings.enableTools,
-      );
-
-      await for (final ev in stream) {
-        switch (ev) {
-          case ChatDeltaEvent(:final text):
-            content += text;
-            currentAssistant = currentAssistant.copyWith(content: content, status: MessageStatus.streaming);
-            _updateMessage(currentAssistant);
-            break;
-          case ChatToolCallsEvent(:final calls):
-            toolCalls = calls;
-            break;
-          case ChatErrorEvent(:final message):
-            hadError = true;
-            errorMsg = message;
-            break;
-          case ChatDoneEvent():
-            break;
-        }
-        if (hadError) break;
-      }
-
-      if (hadError) {
-        currentAssistant = currentAssistant.copyWith(
-          content: content.isEmpty ? '❌ Erro: $errorMsg' : content,
-          status: MessageStatus.error,
-          error: errorMsg,
-        );
-        _updateMessage(currentAssistant);
-        return;
-      }
-
-      // Finaliza o assistant message (com tool_calls se houver)
-      currentAssistant = currentAssistant.copyWith(
-        content: content,
-        toolCalls: toolCalls,
-        status: toolCalls.isEmpty ? MessageStatus.complete : MessageStatus.toolRunning,
-      );
-      _updateMessage(currentAssistant);
-
-      if (toolCalls.isEmpty) {
-        // Sem tool calls — fim do loop
-        return;
-      }
-
-      // Executa cada tool call e adiciona mensagem "tool" para cada
-      currentHistory = List<ChatMessage>.from(currentHistory);
-      // Atualiza o assistant atual no histórico com tool_calls incluídas
-      final assistantIdx = currentHistory.indexWhere((m) => m.id == currentAssistant.id);
-      if (assistantIdx >= 0) {
-        currentHistory[assistantIdx] = currentAssistant;
-      } else {
-        currentHistory.add(currentAssistant);
-      }
-
-      for (final tc in toolCalls) {
-        final result = ToolExecutor.execute(tc.name, tc.arguments);
-        final toolMsg = ChatMessage.tool(
-          toolCallId: tc.id,
-          toolName: tc.name,
-          content: result.content,
-        );
-        _messages = [..._messages, toolMsg];
-        currentHistory.add(toolMsg);
-        notifyListeners();
-      }
-
-      // Próxima iteração: nova mensagem assistant que vai receber a resposta final
-      currentAssistant = ChatMessage.assistant(content: '');
-      _messages = [..._messages, currentAssistant];
-      notifyListeners();
-    }
-
-    // Se excedeu iterações, marca erro
-    currentAssistant = currentAssistant.copyWith(
-      content: '⚠️ Limite de tool calls encadeados atingido.',
-      status: MessageStatus.error,
-    );
-    _updateMessage(currentAssistant);
   }
 
   void _updateMessage(ChatMessage updated) {
@@ -285,10 +396,15 @@ class ChatProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Aborta a requisição em andamento (best-effort — apenas limpa flag).
+  /// Aborta a requisição em andamento (best-effort).
   Future<void> stopGeneration() async {
     _isSending = false;
     notifyListeners();
-    // TODO: chamar /v1/chat/completions/stop no proxy se implementado.
+  }
+
+  @override
+  void dispose() {
+    _accountsStreamSub?.cancel();
+    super.dispose();
   }
 }
