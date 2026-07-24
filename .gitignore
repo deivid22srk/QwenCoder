@@ -46,11 +46,11 @@ macos/Flutter/GeneratedPluginRegistrant.*
 # Web
 web/icons/
 
-# Generated launcher icons
-**/mipmap-*/ic_launcher.png
-**/mipmap-*/ic_launcher_round.png
-**/mipmap-*/ic_launcher_foreground.png
-**/mipmap-*/ic_launcher.xml
+# Generated launcher icons (kept in repo so build works without flutter_launcher_icons)
+# **/mipmap-*/ic_launcher.png
+# **/mipmap-*/ic_launcher_round.png
+# **/mipmap-*/ic_launcher_foreground.png
+# **/mipmap-*/ic_launcher.xml
 
 # OS files
 .DS_Store
