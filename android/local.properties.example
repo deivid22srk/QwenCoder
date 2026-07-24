@@ -1,0 +1,5 @@
+# Local properties — não deve ser commitado.
+# O CI cria este arquivo automaticamente quando necessário.
+sdk.dir=/usr/local/lib/android-sdk
+flutter.sdk=/opt/flutter
+flutter.buildMode=debug

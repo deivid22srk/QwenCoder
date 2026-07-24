@@ -1,0 +1,70 @@
+# Flutter / Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+build/
+.fvm/
+coverage/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+.project
+.classpath
+.settings/
+
+# Android / Gradle
+android/.gradle/
+android/local.properties
+android/key.properties
+android/app/debug
+android/app/profile
+android/app/release
+**/android/**/gradle-wrapper.jar
+**/.cxx/
+
+# iOS / macOS
+ios/Pods/
+ios/.symlinks/
+ios/Flutter/Flutter.framework
+ios/Flutter/Flutter.podspec
+ios/Flutter/Generated.xcconfig
+ios/Flutter/app.flx
+ios/Flutter/app.zip
+ios/Flutter/flutter_assets/
+ios/Flutter/flutter_export_environment.sh
+ios/ServiceDefinitions.json
+ios/Runner/GeneratedPluginRegistrant.*
+macos/Flutter/GeneratedPluginRegistrant.*
+
+# Web
+web/icons/
+
+# Generated launcher icons
+**/mipmap-*/ic_launcher.png
+**/mipmap-*/ic_launcher_round.png
+**/mipmap-*/ic_launcher_foreground.png
+**/mipmap-*/ic_launcher.xml
+
+# OS files
+.DS_Store
+*.swp
+*.swo
+*~
+Thumbs.db
+
+# Env / secrets
+.env
+.env.local
+*.keystore
+!debug.keystore
+
+# Logs
+*.log
+flutter_*.png
